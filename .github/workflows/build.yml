@@ -138,12 +138,18 @@ jobs:
 
             bool _isEditLayoutMode = false;
             bool _isToolbarCollapsed = false;
-            bool _isRightStickSwipeMode = true;
+            bool _isRightStickSwipeMode = false; // 默认开启标准双摇杆回中模式，确保左右摇杆8向/360°映射正常
             bool _isGyroEnabled = false;
             bool _gyroHoldL2 = false;
             bool _gyroFlat = false;
             bool _gyroInvX = false;
             bool _gyroInvY = false;
+            bool _invertLeftX = false;
+            bool _invertLeftY = false;
+            bool _invertRightX = false;
+            bool _invertRightY = false;
+            bool _swapLeftAxes = false;
+            bool _swapRightAxes = false;
             int _labelStyle = 0; // 0 Xbox, 1 PS, 2 Switch(仅影响屏幕上的按键标签)
             String _hidProfile = 'xbox'; // xbox | dinput | ps5 | switch
             String _btStatus = '未连接 (点蓝牙图标)';
@@ -158,7 +164,11 @@ jobs:
             final Set<String> _pressedButtons = {};
             Offset _leftStickPos = Offset.zero;
             Offset _rightStickPos = Offset.zero;
+            Offset _previewLeft = Offset.zero;
             Offset _previewRight = Offset.zero;
+            int? _leftStickPointer;
+            int? _rightStickPointer;
+            int? _swipePointer;
             double _swipeAccX = 0, _swipeAccY = 0;
             Offset _swipeVel = Offset.zero;
             List<double> _lastGyro = [0, 0, 0, 1];
@@ -177,8 +187,6 @@ jobs:
               super.initState();
               _layoutConfigs = defaultLayout();
               _loadSavedLayout();
-              // 不再用固定 8ms 全量轮询；输入变化后最多延迟约 2ms 再打包一次，
-              // 避免 Flutter Timer + MethodChannel 排队造成的额外输入延迟。
               _uiTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) => _refreshStatus());
             }
 
@@ -208,7 +216,6 @@ jobs:
                 if (saved != null && saved.isNotEmpty) {
                   final List decoded = jsonDecode(saved) as List;
                   final loaded = decoded.map((e) => PadWidgetConfig.fromJson(Map<String, dynamic>.from(e as Map))).toList();
-                  // 旧版本保存的布局里没有的新按键,用默认位置补上
                   for (final d in defaultLayout()) {
                     if (!loaded.any((e) => e.id == d.id)) loaded.add(d);
                   }
@@ -223,13 +230,24 @@ jobs:
               } catch (_) {}
             }
 
-            Offset _curve(Offset raw, double sens) {
-              final double mag = raw.distance;
-              if (mag <= _stickDeadzone) return Offset.zero;
+            /// 独立 X/Y 双轴死区与响应曲线处理，兼顾正交4向与斜向4向（完整8方向+360°无极坐标耦合）
+            Offset _curve(Offset raw, double sens, {bool invX = false, bool invY = false, bool swapAxes = false}) {
+              double rx = swapAxes ? raw.dy : raw.dx;
+              double ry = swapAxes ? raw.dx : raw.dy;
+              if (invX) rx = -rx;
+              if (invY) ry = -ry;
+
+              final double mag = math.sqrt(rx * rx + ry * ry);
+              if (mag <= _stickDeadzone || mag == 0.0) return Offset.zero;
+
               final double n = ((mag - _stickDeadzone) / (1.0 - _stickDeadzone)).clamp(0.0, 1.0);
-              final double c = (math.pow(n, 1.2) * sens).clamp(0.0, 1.0).toDouble();
-              final double a = math.atan2(raw.dy, raw.dx);
-              return Offset(math.cos(a) * c, math.sin(a) * c);
+              final double c = (math.pow(n, 1.15) * sens).clamp(0.0, 1.0).toDouble();
+              final double ux = rx / mag;
+              final double uy = ry / mag;
+              return Offset(
+                (ux * c).clamp(-1.0, 1.0).toDouble(),
+                (uy * c).clamp(-1.0, 1.0).toDouble(),
+              );
             }
 
             Offset _gyroOutput() {
@@ -237,7 +255,6 @@ jobs:
               if (_gyroHoldL2 && !_pressedButtons.contains('BTN_L2')) return Offset.zero;
               final gx = _lastGyro[0], gy = _lastGyro[1], gz = _lastGyro[2], s = _lastGyro[3];
               double dz(double v) => v.abs() < 0.03 ? 0.0 : v;
-              // 掌机式横握:左右转身 = 绕 x 轴;平放:绕 z 轴
               double yaw = _gyroFlat ? -dz(gz) : -dz(gx) * s;
               double pitch = dz(gy) * s;
               if (_gyroInvX) yaw = -yaw;
@@ -246,10 +263,6 @@ jobs:
               return Offset(yaw * k, pitch * k);
             }
 
-            /// 低延迟输入调度：
-            /// - 不再每 8ms 无条件发送；
-            /// - 有输入变化时只保留一个待发送任务，2ms 内的多次触摸合并为最新状态；
-            /// - 如果蓝牙发送尚未完成，只发送最新状态，不堆积旧报告。
             void _requestSend() {
               if (_isEditLayoutMode || _sendQueued) return;
               _sendQueued = true;
@@ -262,8 +275,6 @@ jobs:
 
             void _startInputTicker() {
               _inputTicker?.cancel();
-              // 陀螺仪和滑屏视角需要在“没有按键变化”时也持续发送。
-              // 4ms 仅作为触发器，_requestSend 会合并重复任务，避免堆积。
               _inputTicker = Timer.periodic(const Duration(milliseconds: 4), (_) {
                 if (!_isEditLayoutMode) _requestSend();
               });
@@ -289,19 +300,36 @@ jobs:
               if (_isEditLayoutMode) return;
               try {
                 if (_isRightStickSwipeMode) {
-                  final ix = _swipeAccX / 18.0 * _swipeViewSensitivity;
-                  final iy = _swipeAccY / 18.0 * _swipeViewSensitivity;
-                  _swipeVel = Offset(_swipeVel.dx * 0.5 + ix * 0.5, _swipeVel.dy * 0.5 + iy * 0.5);
+                  final ix = (_invertRightX ? -_swipeAccX : _swipeAccX) / 18.0 * _swipeViewSensitivity;
+                  final iy = (_invertRightY ? -_swipeAccY : _swipeAccY) / 18.0 * _swipeViewSensitivity;
+                  final sx = _swapRightAxes ? iy : ix;
+                  final sy = _swapRightAxes ? ix : iy;
+                  _swipeVel = Offset(_swipeVel.dx * 0.45 + sx * 0.55, _swipeVel.dy * 0.45 + sy * 0.55);
                 } else {
                   _swipeVel = Offset.zero;
                 }
                 _swipeAccX = 0;
                 _swipeAccY = 0;
 
-                final left = _curve(_leftStickPos, _leftStickSensitivity);
-                final base = _isRightStickSwipeMode ? _swipeVel : _curve(_rightStickPos, _rightStickSensitivity);
+                final left = _curve(
+                  _leftStickPos,
+                  _leftStickSensitivity,
+                  invX: _invertLeftX,
+                  invY: _invertLeftY,
+                  swapAxes: _swapLeftAxes,
+                );
+                final base = _isRightStickSwipeMode
+                    ? _swipeVel
+                    : _curve(
+                        _rightStickPos,
+                        _rightStickSensitivity,
+                        invX: _invertRightX,
+                        invY: _invertRightY,
+                        swapAxes: _swapRightAxes,
+                      );
                 final g = _gyroOutput();
                 final right = Offset((base.dx + g.dx).clamp(-1.0, 1.0).toDouble(), (base.dy + g.dy).clamp(-1.0, 1.0).toDouble());
+                _previewLeft = left;
                 _previewRight = right;
 
                 int mask = 0;
@@ -320,8 +348,6 @@ jobs:
                 bd.setUint8(8, _pressedButtons.contains('BTN_L2') ? 255 : 0);
                 bd.setUint8(9, _pressedButtons.contains('BTN_R2') ? 255 : 0);
 
-                // 输入发送不再等待原生层返回，避免 MethodChannel 往返把下一帧卡住。
-                // 陀螺仪按 60Hz 独立刷新即可，不应阻塞手柄输入通道。
                 unawaited(_ch.invokeMethod<List<dynamic>>('sendState', p).then((res) {
                   if (res != null && res.length >= 4) {
                     _lastGyro = res.map((e) => (e as num).toDouble()).toList();
@@ -358,15 +384,22 @@ jobs:
                     shrinkWrap: true,
                     padding: const EdgeInsets.all(12),
                     children: [
-                      const Text('连接方式', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
+                      const Text('连接方式 (兼容 Android 11 ~ 15+)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
                       ListTile(
                         leading: const Icon(Icons.visibility),
                         title: const Text('让手机可被发现 (首次配对)'),
-                        subtitle: const Text('然后在电脑/平板/电视的蓝牙设置里搜索并配对本手机'),
+                        subtitle: const Text('然后在电脑/平板/电视/接收端手机的蓝牙设置里搜索并配对本手机'),
                         onTap: () async {
                           Navigator.pop(ctx);
                           try { await _ch.invokeMethod('makeDiscoverable'); } catch (_) {}
                         },
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                        child: Text(
+                          '提示：切换手柄协议或更新后，若发现方向异常，请先在接收端系统的蓝牙设置中“取消配对/忽略此设备”，再重新配对（防止系统缓存旧 HID 描述符）。',
+                          style: TextStyle(fontSize: 11, color: Colors.amberAccent),
+                        ),
                       ),
                       const Divider(color: Colors.white24),
                       if (bonded.isEmpty)
@@ -400,16 +433,29 @@ jobs:
                         top: 56,
                         right: 0,
                         bottom: 0,
-                        child: GestureDetector(
+                        child: Listener(
                           behavior: HitTestBehavior.translucent,
-                          onPanUpdate: _onSwipe,
+                          onPointerDown: (e) {
+                            _swipePointer ??= e.pointer;
+                          },
+                          onPointerMove: (e) {
+                            if (_swipePointer == e.pointer) {
+                              _onSwipeDelta(e.delta);
+                            }
+                          },
+                          onPointerUp: (e) {
+                            if (_swipePointer == e.pointer) _swipePointer = null;
+                          },
+                          onPointerCancel: (e) {
+                            if (_swipePointer == e.pointer) _swipePointer = null;
+                          },
                           child: Container(
                             decoration: const BoxDecoration(border: Border(left: BorderSide(color: Color(0x2600E5FF), width: 1))),
                             alignment: Alignment.bottomRight,
                             padding: const EdgeInsets.all(16),
-                            child: Text(
+                            child: const Text(
                               '3D 自由滑屏视角区',
-                              style: const TextStyle(color: Color(0x7300E5FF), fontSize: 12),
+                              style: TextStyle(color: Color(0x7300E5FF), fontSize: 12),
                             ),
                           ),
                         ),
@@ -449,10 +495,10 @@ jobs:
               );
             }
 
-            void _onSwipe(DragUpdateDetails d) {
+            void _onSwipeDelta(Offset delta) {
               if (_isEditLayoutMode) return;
-              _swipeAccX += d.delta.dx;
-              _swipeAccY += d.delta.dy;
+              _swipeAccX += delta.dx;
+              _swipeAccY += delta.dy;
               _requestSend();
             }
 
@@ -472,8 +518,20 @@ jobs:
                     ),
                     Flexible(
                       flex: 2,
-                      child: Text(_btStatus, maxLines: 1, overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 12, color: Colors.white70)),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(_btStatus, maxLines: 1, overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 11, color: Colors.white70)),
+                          Text(
+                            'L(${_previewLeft.dx.toStringAsFixed(2)}, ${_previewLeft.dy.toStringAsFixed(2)})  R(${_previewRight.dx.toStringAsFixed(2)}, ${_previewRight.dy.toStringAsFixed(2)})',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 10, color: Colors.cyanAccent),
+                          ),
+                        ],
+                      ),
                     ),
                     const SizedBox(width: 8),
                     Expanded(
@@ -527,15 +585,29 @@ jobs:
               Widget child;
               if (cfg.id == 'LEFT_STICK') {
                 child = _buildAnalogStick(
-                  size: finalSize, label: 'L', value: _leftStickPos,
-                  onChanged: (v) { setState(() => _leftStickPos = v); _requestSend(); },
+                  size: finalSize,
+                  label: 'L',
+                  value: _leftStickPos,
+                  activePointer: _leftStickPointer,
+                  onPointerChanged: (p) => _leftStickPointer = p,
+                  onChanged: (v) {
+                    setState(() => _leftStickPos = v);
+                    _requestSend();
+                  },
                 );
               } else if (cfg.id == 'RIGHT_STICK') {
                 child = _isRightStickSwipeMode
                     ? _buildSwipeZone(finalSize)
                     : _buildAnalogStick(
-                        size: finalSize, label: 'R', value: _rightStickPos,
-                        onChanged: (v) { setState(() => _rightStickPos = v); _requestSend(); },
+                        size: finalSize,
+                        label: 'R',
+                        value: _rightStickPos,
+                        activePointer: _rightStickPointer,
+                        onPointerChanged: (p) => _rightStickPointer = p,
+                        onChanged: (v) {
+                          setState(() => _rightStickPos = v);
+                          _requestSend();
+                        },
                       );
               } else {
                 child = _buildActionButton(cfg.fn, _label(cfg.fn), finalSize);
@@ -567,10 +639,14 @@ jobs:
               );
             }
 
+            /// 使用底层 Listener + 独立 pointerId 跟踪代替 GestureDetector(onPan)，
+            /// 彻底解决多指触控冲突、全屏滑屏手势抢夺以及正交/斜向 8 方向死锁问题。
             Widget _buildAnalogStick({
               required double size,
               required String label,
               required Offset value,
+              required int? activePointer,
+              required ValueChanged<int?> onPointerChanged,
               required ValueChanged<Offset> onChanged,
             }) {
               final double radius = size / 2;
@@ -578,39 +654,50 @@ jobs:
               final double maxDist = math.max(1.0, radius - knob);
 
               void update(Offset local) {
-                // X/Y 必须分别计算，不能把两个轴耦合在一起。
-                // 同时采用径向限幅，保证圆周边缘仍能得到完整的 ±1 范围。
-                final Offset delta = local - Offset(radius, radius);
+                final double dx = local.dx - radius;
+                final double dy = local.dy - radius;
+                final double dist = math.sqrt(dx * dx + dy * dy);
 
-                // X/Y 两个轴独立计算，避免部分触控/HID 解析路径把两个轴耦合成
-                // “左上/右下”两条对角线；最后只做圆形限幅。
-                double x = (delta.dx / maxDist).clamp(-1.0, 1.0).toDouble();
-                double y = (delta.dy / maxDist).clamp(-1.0, 1.0).toDouble();
-
-                const double dead = 0.055;
-                double remap(double v) {
-                  final double a = v.abs();
-                  if (a <= dead) return 0.0;
-                  final double m = ((a - dead) / (1.0 - dead)).clamp(0.0, 1.0).toDouble();
-                  return v.isNegative ? -m : m;
+                double nx;
+                double ny;
+                if (dist > maxDist && dist > 0.0) {
+                  nx = dx / dist;
+                  ny = dy / dist;
+                } else {
+                  nx = dx / maxDist;
+                  ny = dy / maxDist;
                 }
-                x = remap(x);
-                y = remap(y);
 
-                final double mag = math.sqrt(x * x + y * y);
-                if (mag > 1.0) {
-                  x /= mag;
-                  y /= mag;
-                }
-                onChanged(Offset(x, y));
+                nx = nx.clamp(-1.0, 1.0).toDouble();
+                ny = ny.clamp(-1.0, 1.0).toDouble();
+                onChanged(Offset(nx, ny));
               }
 
-              return GestureDetector(
+              return Listener(
                 behavior: HitTestBehavior.opaque,
-                onPanStart: (d) => update(d.localPosition),
-                onPanUpdate: (d) => update(d.localPosition),
-                onPanEnd: (_) { onChanged(Offset.zero); _requestSend(); },
-                onPanCancel: () { onChanged(Offset.zero); _requestSend(); },
+                onPointerDown: (PointerDownEvent e) {
+                  if (activePointer == null) {
+                    onPointerChanged(e.pointer);
+                    update(e.localPosition);
+                  }
+                },
+                onPointerMove: (PointerMoveEvent e) {
+                  if (activePointer == e.pointer) {
+                    update(e.localPosition);
+                  }
+                },
+                onPointerUp: (PointerUpEvent e) {
+                  if (activePointer == e.pointer) {
+                    onPointerChanged(null);
+                    onChanged(Offset.zero);
+                  }
+                },
+                onPointerCancel: (PointerCancelEvent e) {
+                  if (activePointer == e.pointer) {
+                    onPointerChanged(null);
+                    onChanged(Offset.zero);
+                  }
+                },
                 child: Container(
                   width: size,
                   height: size,
@@ -619,29 +706,49 @@ jobs:
                     color: const Color(0x14FFFFFF),
                     border: Border.all(color: const Color(0x6600E5FF), width: 2),
                   ),
-                  child: Center(
-                    child: Transform.translate(
-                      offset: Offset(value.dx * (radius - knob), value.dy * (radius - knob)),
-                      child: Container(
-                        width: knob * 2,
-                        height: knob * 2,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Color(0xBF00E5FF),
-                          boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      // 十字与八向参考刻度线，方便直观确认上下左右与斜向输出
+                      Container(width: size * 0.82, height: 1, color: const Color(0x2200E5FF)),
+                      Container(width: 1, height: size * 0.82, color: const Color(0x2200E5FF)),
+                      Transform.translate(
+                        offset: Offset(value.dx * maxDist, value.dy * maxDist),
+                        child: Container(
+                          width: knob * 2,
+                          height: knob * 2,
+                          decoration: const BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Color(0xBF00E5FF),
+                            boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
+                          ),
+                          alignment: Alignment.center,
+                          child: Text(label, style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
                         ),
-                        alignment: Alignment.center,
-                        child: Text(label, style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
                       ),
-                    ),
+                    ],
                   ),
                 ),
               );
             }
 
             Widget _buildSwipeZone(double size) {
-              return GestureDetector(
-                onPanUpdate: _onSwipe,
+              return Listener(
+                behavior: HitTestBehavior.opaque,
+                onPointerDown: (e) {
+                  _swipePointer ??= e.pointer;
+                },
+                onPointerMove: (e) {
+                  if (_swipePointer == e.pointer) {
+                    _onSwipeDelta(e.delta);
+                  }
+                },
+                onPointerUp: (e) {
+                  if (_swipePointer == e.pointer) _swipePointer = null;
+                },
+                onPointerCancel: (e) {
+                  if (_swipePointer == e.pointer) _swipePointer = null;
+                },
                 child: Container(
                   width: size * 1.25,
                   height: size,
@@ -745,38 +852,38 @@ jobs:
                             crossAxisAlignment: CrossAxisAlignment.start,
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              const Text('设置', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
+                              const Text('设置 (兼容 Android 11+ 全向摇杆映射)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
                               const Divider(color: Colors.white24),
                               const Text('手柄协议(蓝牙发给主机的类型)', style: TextStyle(fontSize: 13)),
                               RadioListTile<String>(
                                 dense: true,
-                                title: const Text('Xbox / XInput 兼容'),
-                                subtitle: const Text('Xbox 风格 ABXY + LT/RT + 16-bit 摇杆'),
+                                title: const Text('Xbox / XInput 兼容 (推荐 Android 11+ / Windows)'),
+                                subtitle: const Text('独立 4 轴 16-bit 摇杆 (X/Y + Z/Rz) + LT/RT，彻底解决左上/右下对角坍缩'),
                                 value: 'xbox', groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
                               RadioListTile<String>(
                                 dense: true,
                                 title: const Text('DirectInput 通用'),
-                                subtitle: const Text('Windows 老游戏 / 模拟器兼容'),
+                                subtitle: const Text('标准 8-bit 独立双摇杆 (X/Y + Z/Rz) + 扳机 (Rx/Ry)，兼容模拟器与映射器'),
                                 value: 'dinput', groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
                               RadioListTile<String>(
                                 dense: true,
                                 title: const Text('PS5 DualSense 兼容'),
-                                subtitle: const Text('采用 DualSense BT 基础输入布局；不伪造 Sony VID/PID'),
+                                subtitle: const Text('无符号 8-bit 独立双摇杆 (0..255 中心 128)，修复负数符号截断'),
                                 value: 'ps5', groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
                               RadioListTile<String>(
                                 dense: true,
                                 title: const Text('Switch Pro 兼容'),
-                                subtitle: const Text('采用 Pro Controller 0x30 输入报告布局；完整主机握手需专用 HID 栈'),
+                                subtitle: const Text('16-bit 独立四轴标准 HID 布局'),
                                 value: 'switch', groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
-                              const Text('切换协议后请停止当前 HID 服务并重新配对；部分主机会缓存 HID 描述符。',
+                              const Text('切换协议后请点顶部蓝牙图标重启 HID，并在接收端删除旧蓝牙配对后重新连接。',
                                   style: TextStyle(fontSize: 11, color: Colors.amberAccent)),
                               const SizedBox(height: 8),
                               const Text('屏幕按键样式(只改标签和位置含义,不改协议)', style: TextStyle(fontSize: 13)),
@@ -792,6 +899,7 @@ jobs:
                               SwitchListTile(
                                 dense: true,
                                 title: const Text('右摇杆改为“3D手游随意滑屏控制视角”'),
+                                subtitle: const Text('映射按键/校准摇杆时请关闭此项，使用传统回中右摇杆'),
                                 value: _isRightStickSwipeMode,
                                 onChanged: (v) => both(() => _isRightStickSwipeMode = v),
                               ),
@@ -799,6 +907,14 @@ jobs:
                               _slider('右摇杆(传统)灵敏度', _rightStickSensitivity, 0.2, 2.5, (v) => both(() => _rightStickSensitivity = v)),
                               _slider('右摇杆(滑屏视角)灵敏度', _swipeViewSensitivity, 0.3, 4.0, (v) => both(() => _swipeViewSensitivity = v)),
                               _slider('摇杆中心死区', _stickDeadzone, 0.0, 0.30, (v) => both(() => _stickDeadzone = v)),
+                              const Divider(color: Colors.white24),
+                              const Text('摇杆轴向修正 (适配不同游戏/映射器坐标系)', style: TextStyle(fontSize: 13, color: Colors.cyanAccent)),
+                              SwitchListTile(dense: true, title: const Text('左摇杆 X 轴反向 (左右对调)'), value: _invertLeftX, onChanged: (v) => both(() => _invertLeftX = v)),
+                              SwitchListTile(dense: true, title: const Text('左摇杆 Y 轴反向 (上下对调)'), value: _invertLeftY, onChanged: (v) => both(() => _invertLeftY = v)),
+                              SwitchListTile(dense: true, title: const Text('左摇杆 X/Y 轴互换'), value: _swapLeftAxes, onChanged: (v) => both(() => _swapLeftAxes = v)),
+                              SwitchListTile(dense: true, title: const Text('右摇杆 X 轴反向 (左右对调)'), value: _invertRightX, onChanged: (v) => both(() => _invertRightX = v)),
+                              SwitchListTile(dense: true, title: const Text('右摇杆 Y 轴反向 (上下对调)'), value: _invertRightY, onChanged: (v) => both(() => _invertRightY = v)),
+                              SwitchListTile(dense: true, title: const Text('右摇杆 X/Y 轴互换'), value: _swapRightAxes, onChanged: (v) => both(() => _swapRightAxes = v)),
                               const Divider(color: Colors.white24),
                               SwitchListTile(dense: true, title: const Text('陀螺仪体感(叠加到右摇杆)'), value: _isGyroEnabled, onChanged: (v) => both(() => _isGyroEnabled = v)),
                               _slider('体感灵敏度', _gyroSensitivity, 0.1, 4.0, (v) => both(() => _gyroSensitivity = v)),
@@ -850,6 +966,7 @@ jobs:
           import android.hardware.SensorEventListener;
           import android.hardware.SensorManager;
           import android.os.Build;
+          import android.view.Display;
           import android.view.Surface;
           import io.flutter.embedding.android.FlutterActivity;
           import io.flutter.embedding.engine.FlutterEngine;
@@ -885,7 +1002,7 @@ jobs:
               private long lastSendNs = 0;
 
               // ------------------------------------------------------------------
-              // HID 描述符
+              // HID 描述符 (针对 Android 11/12/13/14/15+ hid-generic 驱动严格优化)
               // ------------------------------------------------------------------
               private static byte[] b(int... v) {
                   byte[] r = new byte[v.length];
@@ -893,54 +1010,152 @@ jobs:
                   return r;
               }
 
-              /** Xbox One S 蓝牙手柄的输入描述符(Report ID 1,负载 16 字节)。 */
+              /**
+               * Xbox / XInput 兼容蓝牙手柄输入描述符 (Report ID 1, 负载 16 字节)。
+               * 关键修复：
+               * 1. 移除外层多余的 Usage(Pointer) + Collection(Physical) 嵌套，将 X(0x30), Y(0x31), Z(0x32), Rz(0x35)
+               *    四个 16-bit 轴放在同一个连续 Input 块内（Logical Minimum 0, Logical Maximum 65535, Report Size 16, Report Count 4）。
+               *    避免 Android 11+ 内核 hid-input 因嵌套 Physical Collection 边界或 0x27 符号扩展问题将双轴合并或截断为只剩左上/右下。
+               */
               private static final byte[] DESC_XBOX = b(
-                  0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
-                  0x09, 0x01, 0xA1, 0x00, 0x09, 0x30, 0x09, 0x31,
-                  0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xC0,
-                  0x09, 0x01, 0xA1, 0x00, 0x09, 0x32, 0x09, 0x35,
-                  0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xC0,
-                  0x05, 0x02, 0x09, 0xC5, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x95, 0x01, 0x75, 0x0A, 0x81, 0x02,
-                  0x15, 0x00, 0x25, 0x00, 0x75, 0x06, 0x95, 0x01, 0x81, 0x03,
-                  0x05, 0x02, 0x09, 0xC4, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x95, 0x01, 0x75, 0x0A, 0x81, 0x02,
-                  0x15, 0x00, 0x25, 0x00, 0x75, 0x06, 0x95, 0x01, 0x81, 0x03,
-                  0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x66, 0x14, 0x00,
-                  0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
-                  0x75, 0x04, 0x95, 0x01, 0x15, 0x00, 0x25, 0x00, 0x35, 0x00, 0x45, 0x00, 0x65, 0x00, 0x81, 0x03,
-                  0x05, 0x09, 0x19, 0x01, 0x29, 0x0F, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02,
-                  0x15, 0x00, 0x25, 0x00, 0x75, 0x01, 0x95, 0x01, 0x81, 0x03,
-                  0x05, 0x0C, 0x0A, 0x24, 0x02, 0x15, 0x00, 0x25, 0x01, 0x95, 0x01, 0x75, 0x01, 0x81, 0x02,
-                  0x15, 0x00, 0x25, 0x00, 0x75, 0x07, 0x95, 0x01, 0x81, 0x03,
-                  0xC0
+                  0x05, 0x01,                   // Usage Page (Generic Desktop)
+                  0x09, 0x05,                   // Usage (Game Pad)
+                  0xA1, 0x01,                   // Collection (Application)
+                  0x85, 0x01,                   //   Report ID (1)
+                  // 左摇杆 X/Y + 右摇杆 Z/Rz (4 个独立 16-bit 无符号轴: 0..65535, 中心 32768)
+                  0x05, 0x01,                   //   Usage Page (Generic Desktop)
+                  0x09, 0x30,                   //   Usage (X)  -> 左摇杆水平
+                  0x09, 0x31,                   //   Usage (Y)  -> 左摇杆垂直
+                  0x09, 0x32,                   //   Usage (Z)  -> 右摇杆水平
+                  0x09, 0x35,                   //   Usage (Rz) -> 右摇杆垂直
+                  0x15, 0x00,                   //   Logical Minimum (0)
+                  0x27, 0xFF, 0xFF, 0x00, 0x00, //   Logical Maximum (65535)
+                  0x35, 0x00,                   //   Physical Minimum (0)
+                  0x47, 0xFF, 0xFF, 0x00, 0x00, //   Physical Maximum (65535)
+                  0x75, 0x10,                   //   Report Size (16)
+                  0x95, 0x04,                   //   Report Count (4)
+                  0x81, 0x02,                   //   Input (Data,Var,Abs)
+                  // 左扳机 Brake (0..1023, 10-bit + 6-bit padding)
+                  0x05, 0x02,                   //   Usage Page (Simulation Controls)
+                  0x09, 0xC5,                   //   Usage (Brake / LT)
+                  0x15, 0x00,                   //   Logical Minimum (0)
+                  0x26, 0xFF, 0x03,             //   Logical Maximum (1023)
+                  0x35, 0x00,                   //   Physical Minimum (0)
+                  0x46, 0xFF, 0x03,             //   Physical Maximum (1023)
+                  0x75, 0x0A,                   //   Report Size (10)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x81, 0x02,                   //   Input (Data,Var,Abs)
+                  0x75, 0x06,                   //   Report Size (6)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x81, 0x03,                   //   Input (Const,Var,Abs)
+                  // 右扳机 Accelerator (0..1023, 10-bit + 6-bit padding)
+                  0x05, 0x02,                   //   Usage Page (Simulation Controls)
+                  0x09, 0xC4,                   //   Usage (Accelerator / RT)
+                  0x15, 0x00,                   //   Logical Minimum (0)
+                  0x26, 0xFF, 0x03,             //   Logical Maximum (1023)
+                  0x35, 0x00,                   //   Physical Minimum (0)
+                  0x46, 0xFF, 0x03,             //   Physical Maximum (1023)
+                  0x75, 0x0A,                   //   Report Size (10)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x81, 0x02,                   //   Input (Data,Var,Abs)
+                  0x75, 0x06,                   //   Report Size (6)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x81, 0x03,                   //   Input (Const,Var,Abs)
+                  // 十字键 Hat Switch (1..8, 0=released)
+                  0x05, 0x01,                   //   Usage Page (Generic Desktop)
+                  0x09, 0x39,                   //   Usage (Hat switch)
+                  0x15, 0x01,                   //   Logical Minimum (1)
+                  0x25, 0x08,                   //   Logical Maximum (8)
+                  0x35, 0x00,                   //   Physical Minimum (0)
+                  0x46, 0x3B, 0x01,             //   Physical Maximum (315)
+                  0x66, 0x14, 0x00,             //   Unit (Eng Rot: Angular Pos)
+                  0x75, 0x04,                   //   Report Size (4)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x81, 0x42,                   //   Input (Data,Var,Abs,Null)
+                  0x75, 0x04,                   //   Report Size (4)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x65, 0x00,                   //   Unit (None)
+                  0x81, 0x03,                   //   Input (Const,Var,Abs)
+                  // 15 个功能按键 + 1 bit 填充 + 1 byte 预留
+                  0x05, 0x09,                   //   Usage Page (Button)
+                  0x19, 0x01,                   //   Usage Minimum (1)
+                  0x29, 0x0F,                   //   Usage Maximum (15)
+                  0x15, 0x00,                   //   Logical Minimum (0)
+                  0x25, 0x01,                   //   Logical Maximum (1)
+                  0x75, 0x01,                   //   Report Size (1)
+                  0x95, 0x0F,                   //   Report Count (15)
+                  0x81, 0x02,                   //   Input (Data,Var,Abs)
+                  0x75, 0x01,                   //   Report Size (1)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x81, 0x03,                   //   Input (Const,Var,Abs)
+                  0x75, 0x08,                   //   Report Size (8)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x81, 0x03,                   //   Input (Const,Var,Abs)
+                  0xC0                          // End Collection
               );
 
-              /** 通用 DirectInput 手柄(Report ID 1, 13 字节)。
-               * 四个摇杆轴改为独立 16-bit 有符号轴，兼容 Android 11+ / Windows 常见 HID 解析器。
+              /**
+               * 通用 DirectInput 手柄 (Report ID 1, 负载 9 字节)。
+               * 关键修复：
+               * 原描述符在摇杆与扳机中重复声明了 Usage 0x33(Rx) 和 0x34(Ry)，导致 Android 11+ 的 hid-generic 驱动发生轴覆盖冲突！
+               * 现修正为：左摇杆 X(0x30)/Y(0x31)，右摇杆 Z(0x32)/Rz(0x35)（全部使用 0..255 无符号 8-bit，中心 128，消除有符号补码跨平台歧义），
+               * 扳机使用 Rx(0x33)/Ry(0x34)（0..255）。
                */
               private static final byte[] DESC_DINPUT = b(
-                  0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
-                  0x05, 0x09, 0x19, 0x01, 0x29, 0x10,
-                  0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
-                  0x05, 0x01, 0x09, 0x39,
-                  0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
-                  0x75, 0x04, 0x95, 0x01, 0x81, 0x03,
-                  0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x33, 0x09, 0x34,
-                  0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F,
-                  0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
-                  0x05, 0x02, 0x09, 0xC5, 0x15, 0x00, 0x26, 0xFF, 0x00,
-                  0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
-                  0xC0
+                  0x05, 0x01,                   // Usage Page (Generic Desktop)
+                  0x09, 0x05,                   // Usage (Game Pad)
+                  0xA1, 0x01,                   // Collection (Application)
+                  0x85, 0x01,                   //   Report ID (1)
+                  // 16 个按键 (2 字节)
+                  0x05, 0x09,                   //   Usage Page (Button)
+                  0x19, 0x01,                   //   Usage Minimum (1)
+                  0x29, 0x10,                   //   Usage Maximum (16)
+                  0x15, 0x00,                   //   Logical Minimum (0)
+                  0x25, 0x01,                   //   Logical Maximum (1)
+                  0x75, 0x01,                   //   Report Size (1)
+                  0x95, 0x10,                   //   Report Count (16)
+                  0x81, 0x02,                   //   Input (Data,Var,Abs)
+                  // 十字键 Hat Switch (1 字节: 低 4 位 Hat, 高 4 位 Padding)
+                  0x05, 0x01,                   //   Usage Page (Generic Desktop)
+                  0x09, 0x39,                   //   Usage (Hat switch)
+                  0x15, 0x01,                   //   Logical Minimum (1)
+                  0x25, 0x08,                   //   Logical Maximum (8)
+                  0x35, 0x00,                   //   Physical Minimum (0)
+                  0x46, 0x3B, 0x01,             //   Physical Maximum (315)
+                  0x65, 0x14,                   //   Unit (Eng Rot: Angular Pos)
+                  0x75, 0x04,                   //   Report Size (4)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x81, 0x42,                   //   Input (Data,Var,Abs,Null)
+                  0x65, 0x00,                   //   Unit (None)
+                  0x75, 0x04,                   //   Report Size (4)
+                  0x95, 0x01,                   //   Report Count (1)
+                  0x81, 0x03,                   //   Input (Const,Var,Abs)
+                  // 左摇杆 X/Y + 右摇杆 Z/Rz (4 字节: 0..255 无符号, 中心 128) + 左右扳机 Rx/Ry (2 字节: 0..255)
+                  0x05, 0x01,                   //   Usage Page (Generic Desktop)
+                  0x09, 0x30,                   //   Usage (X)  -> 左摇杆 X
+                  0x09, 0x31,                   //   Usage (Y)  -> 左摇杆 Y
+                  0x09, 0x32,                   //   Usage (Z)  -> 右摇杆 X
+                  0x09, 0x35,                   //   Usage (Rz) -> 右摇杆 Y
+                  0x09, 0x33,                   //   Usage (Rx) -> 左扳机 L2
+                  0x09, 0x34,                   //   Usage (Ry) -> 右扳机 R2
+                  0x15, 0x00,                   //   Logical Minimum (0)
+                  0x26, 0xFF, 0x00,             //   Logical Maximum (255)
+                  0x35, 0x00,                   //   Physical Minimum (0)
+                  0x46, 0xFF, 0x00,             //   Physical Maximum (255)
+                  0x75, 0x08,                   //   Report Size (8)
+                  0x95, 0x06,                   //   Report Count (6)
+                  0x81, 0x02,                   //   Input (Data,Var,Abs)
+                  0xC0                          // End Collection
               );
 
-              
-              /** DualSense Bluetooth basic input profile. Compatibility only:
-               * Android BluetoothHidDevice cannot advertise Sony's VID/PID or implement
-               * the full 0x31/CRC feature-report handshake.
+              /**
+               * DualSense Bluetooth 兼容输入布局 (Report ID 1, 负载 9 字节)。
                */
               private static final byte[] DESC_PS5 = b(
                   0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
                   0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
-                  0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
+                  0x15, 0x00, 0x26, 0xFF, 0x00, 0x35, 0x00, 0x46, 0xFF, 0x00,
+                  0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
                   0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3B, 0x01,
                   0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
                   0x65, 0x00,
@@ -948,21 +1163,24 @@ jobs:
                   0x75, 0x01, 0x95, 0x0E, 0x81, 0x02,
                   0x75, 0x06, 0x95, 0x01, 0x81, 0x01,
                   0x05, 0x01, 0x09, 0x33, 0x09, 0x34,
-                  0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+                  0x15, 0x00, 0x26, 0xFF, 0x00, 0x35, 0x00, 0x46, 0xFF, 0x00,
+                  0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
                   0xC0
               );
 
-              /** Switch-style gamepad compatibility profile.
-               * The face-button/D-pad semantics match Switch Pro. The report is deliberately
-               * standard HID so Windows/Android can bind it without Nintendo's proprietary
-               * 0x80/0x01/0x21 handshake, which BluetoothHidDevice cannot implement.
+              /**
+               * Switch Pro 兼容标准 HID 描述符 (Report ID 0x30, 负载 13 字节)。
+               * 修正：之前描述符声明为有符号 (-32768..32767) 却发送无符号 (0..65535)，导致半边方向溢出反相。
+               * 现统一声明为无符号 0..65535 (中心 32768)，确保四个象限全部正常。
                */
               private static final byte[] DESC_SWITCH = b(
                   0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x30,
                   0x05, 0x09, 0x19, 0x01, 0x29, 0x18, 0x15, 0x00, 0x25, 0x01,
                   0x75, 0x01, 0x95, 0x18, 0x81, 0x02,
                   0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
-                  0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
+                  0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00,
+                  0x35, 0x00, 0x47, 0xFF, 0xFF, 0x00, 0x00,
+                  0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
                   0x75, 0x08, 0x95, 0x02, 0x81, 0x03,
                   0xC0
               );
@@ -973,7 +1191,7 @@ jobs:
                   SELECT = 1 << 12, START = 1 << 13, HOME = 1 << 14, L3 = 1 << 15, R3 = 1 << 16;
 
               // ------------------------------------------------------------------
-              // 生命周期
+              // 生命周期 (兼容 Android 11+ Display 获取与传感器管理)
               // ------------------------------------------------------------------
               @Override
               protected void onResume() {
@@ -982,7 +1200,7 @@ jobs:
                       sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
                       if (sensorManager != null) {
                           Sensor g = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
-                          if (g != null) sensorManager.registerListener(this, g, 5000);
+                          if (g != null) sensorManager.registerListener(this, g, SensorManager.SENSOR_DELAY_GAME);
                       }
                   } catch (Throwable ignored) {}
               }
@@ -1043,7 +1261,6 @@ jobs:
                                   result.notImplemented();
                           }
                       } catch (Throwable t) {
-                          // 任何异常都不能让 App 闪退
                           status = "错误: " + t.getClass().getSimpleName() + " " + t.getMessage();
                           try { result.success(status); } catch (Throwable ignored) {}
                       }
@@ -1052,18 +1269,28 @@ jobs:
 
               private List<Object> gyroList() {
                   int rot = Surface.ROTATION_90;
-                  try { rot = getWindowManager().getDefaultDisplay().getRotation(); } catch (Throwable ignored) {}
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          Display d = getDisplay();
+                          if (d != null) rot = d.getRotation();
+                      } else {
+                          rot = getWindowManager().getDefaultDisplay().getRotation();
+                      }
+                  } catch (Throwable ignored) {}
                   double sign = (rot == Surface.ROTATION_270) ? -1.0 : 1.0;
                   return Arrays.<Object>asList((double) gyro[0], (double) gyro[1], (double) gyro[2], sign);
               }
 
               // ------------------------------------------------------------------
-              // 权限 + 启动 HID
+              // 权限 + 启动 HID (兼容 Android 11 / API 30 与 Android 12+ / API 31+)
               // ------------------------------------------------------------------
               private boolean hasBtPermission() {
-                  if (Build.VERSION.SDK_INT < 31) return true;
-                  return checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
-                      && checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                      return true;
+                  }
+                  boolean connect = checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+                  boolean advertise = checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
+                  return connect && advertise;
               }
 
               private void startHid(String wantedProfile, MethodChannel.Result result) {
@@ -1075,7 +1302,11 @@ jobs:
                       if (pendingResult != null) { result.success("正在等待权限授权…"); return; }
                       pendingResult = result;
                       pendingProfile = wantedProfile;
-                      requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE}, REQ_BT);
+                      requestPermissions(new String[]{
+                          Manifest.permission.BLUETOOTH_CONNECT,
+                          Manifest.permission.BLUETOOTH_ADVERTISE,
+                          Manifest.permission.BLUETOOTH_SCAN
+                      }, REQ_BT);
                       return;
                   }
                   doStart(wantedProfile, result);
@@ -1090,12 +1321,11 @@ jobs:
                   pendingResult = null;
                   pendingProfile = null;
                   if (r == null) return;
-                  boolean ok = grants.length > 0;
-                  for (int g : grants) if (g != PackageManager.PERMISSION_GRANTED) ok = false;
-                  if (ok) doStart(p == null ? "xbox" : p, r);
-                  else {
-                      status = "未授予“附近的设备”权限";
-                      r.success("未授予“附近的设备”权限,请到系统设置→应用→本应用→权限里允许");
+                  if (hasBtPermission()) {
+                      doStart(p == null ? "xbox" : p, r);
+                  } else {
+                      status = "未授予“附近的设备/蓝牙”权限";
+                      r.success("未授予蓝牙权限，请到系统设置→应用→本应用→权限里允许“附近的设备”");
                   }
               }
 
@@ -1114,12 +1344,10 @@ jobs:
                       if (!adapter.isEnabled()) { result.success("请先在系统里打开蓝牙,再点一次"); return; }
                       profile = normalizeProfile(wantedProfile);
 
-                      if (hidDevice != null) {                       // 已有代理:换描述符需要重新注册
+                      if (hidDevice != null) {
                           try { hidDevice.unregisterApp(); } catch (Throwable ignored) {}
                           hostDevice = null;
-                          // unregisterApp 后系统可能需要几十毫秒释放 SDP；立即 registerApp 会偶发失败。
-                          final String p = profile;
-                          result.success("正在切换协议，请稍候并在电脑蓝牙中重新配对");
+                          result.success("正在切换协议，请稍候并在接收端重新配对");
                           new android.os.Handler(getMainLooper()).postDelayed(() -> {
                               try {
                                   if (hidDevice != null) {
@@ -1128,7 +1356,7 @@ jobs:
                               } catch (Throwable t) {
                                   status = "重新注册 HID 出错: " + t.getMessage();
                               }
-                          }, 250);
+                          }, 300);
                           return;
                       }
                       boolean ok = adapter.getProfileProxy(this, new BluetoothProfile.ServiceListener() {
@@ -1158,18 +1386,16 @@ jobs:
                   String name;
                   String description;
                   if ("dinput".equals(profile)) {
-                      // 保持旧版本完全一致，避免 Windows 已配对设备因 SDP 变化无法重连。
                       desc = DESC_DINPUT; name = "Virtual Gamepad"; description = "Virtual Gamepad";
                   } else if ("ps5".equals(profile)) {
                       desc = DESC_PS5; name = "Wireless Controller"; description = "DualSense Compatible Controller";
                   } else if ("switch".equals(profile)) {
                       desc = DESC_SWITCH; name = "Pro Controller"; description = "Switch Pro Compatible Controller";
                   } else {
-                      // Xbox 默认档严格沿用旧版本 SDP。
                       desc = DESC_XBOX; name = "Xbox Wireless Controller"; description = "Virtual Gamepad";
                   }
                   BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
-                      name, description, "VPad", BluetoothHidDevice.SUBCLASS2_GAMEPAD, desc);
+                      name, description, "VPad", BluetoothHidDevice.SUBCLASS1_COMBO, desc);
                   BluetoothHidDevice.Callback cb = newCallback();
                   boolean ok = false;
                   try {
@@ -1178,7 +1404,13 @@ jobs:
                           BluetoothHidDeviceAppQosSettings.MAX);
                       ok = hidDevice.registerApp(sdp, null, qos, executor, cb);
                   } catch (Throwable ignored) {}
-                  if (!ok) ok = hidDevice.registerApp(sdp, null, null, executor, cb);
+                  if (!ok) {
+                      try {
+                          BluetoothHidDeviceAppSdpSettings sdpFallback = new BluetoothHidDeviceAppSdpSettings(
+                              name, description, "VPad", BluetoothHidDevice.SUBCLASS2_GAMEPAD, desc);
+                          ok = hidDevice.registerApp(sdpFallback, null, null, executor, cb);
+                      } catch (Throwable ignored) {}
+                  }
                   return ok;
               }
 
@@ -1187,6 +1419,9 @@ jobs:
                       @Override
                       public void onAppStatusChanged(BluetoothDevice plugged, boolean registered) {
                           status = registered ? "手柄已就绪:请在主机蓝牙里配对本手机" : "手柄服务已注销";
+                          if (registered && plugged != null && hidDevice != null) {
+                              try { hidDevice.connect(plugged); } catch (Throwable ignored) {}
+                          }
                       }
 
                       @Override
@@ -1233,7 +1468,7 @@ jobs:
               }
 
               // ------------------------------------------------------------------
-              // 状态 -> HID 报告
+              // 状态 -> HID 报告 (修正有符号 byte 扩展，避免 s[i] & 0xFF 破坏负方向!)
               // ------------------------------------------------------------------
               private static int hat(int m) {
                   boolean u = (m & UP) != 0, d = (m & DOWN) != 0, l = (m & LEFT) != 0, r = (m & RIGHT) != 0;
@@ -1248,18 +1483,33 @@ jobs:
                   return 0;
               }
 
-              private static int axis16(byte v) {
-                  int a = 32768 + Math.round(v / 127f * 32767f);
+              /**
+               * DualSense 使用 0..7 表示 8 方向，8 表示松开
+               */
+              private static int hatPs5(int m) {
+                  int h = hat(m);
+                  return h == 0 ? 8 : (h - 1);
+              }
+
+              /**
+               * 将有符号 byte (-127..+127) 线性映射到无符号 8-bit (0..255，中心 128)。
+               * 注意：绝不能写 (v & 0xFF) + 128，否则负数 (-127..-1) 会变成 (129..255) + 128 溢出截断！
+               */
+              private static byte axis8Unsigned(byte v) {
+                  int u = 128 + (int) v; // v 是有符号 -127..127，直接加 128 得到 1..255，0 对应 128
+                  if (u < 0) u = 0;
+                  if (u > 255) u = 255;
+                  return (byte) u;
+              }
+
+              /**
+               * 将有符号 byte (-127..+127) 线性映射到无符号 16-bit (0..65535，中心 32768)。
+               */
+              private static int axis16Unsigned(byte v) {
+                  int iv = (int) v; // 保持符号扩展 (-127..+127)
+                  if (iv == 0) return 32768;
+                  int a = Math.round(32768f + (iv / 127f) * 32767f);
                   return Math.max(0, Math.min(65535, a));
-              }
-
-              private static int signedAxis16(byte v) {
-                  return Math.max(-32768, Math.min(32767, Math.round(v / 127f * 32767f)));
-              }
-
-              private static void putS16(byte[] r, int off, int v) {
-                  r[off] = (byte)(v & 0xFF);
-                  r[off + 1] = (byte)((v >> 8) & 0xFF);
               }
 
               private static void put16(byte[] r, int off, int v) {
@@ -1282,17 +1532,17 @@ jobs:
                   if ((mask & HOME) != 0) btn |= 1 << 10;
                   if ((mask & L2) != 0) btn |= 1 << 11;
                   if ((mask & R2) != 0) btn |= 1 << 12;
-
-                  byte[] r = new byte[13];
-                  r[0] = (byte)(btn & 0xFF);
-                  r[1] = (byte)((btn >> 8) & 0xFF);
-                  r[2] = (byte)hat(mask);
-                  putS16(r, 3, signedAxis16(s[4]));
-                  putS16(r, 5, signedAxis16(s[5]));
-                  putS16(r, 7, signedAxis16(s[6]));
-                  putS16(r, 9, signedAxis16(s[7]));
-                  r[11] = s[8];
-                  r[12] = s[9];
+                  byte[] r = new byte[9];
+                  r[0] = (byte) (btn & 0xFF);
+                  r[1] = (byte) ((btn >> 8) & 0xFF);
+                  r[2] = (byte) hat(mask);
+                  // 4 个摇杆轴统一转为无符号 0..255 (中心 128)，与 DESC_DINPUT 的 Logical 0..255 严格对应
+                  r[3] = axis8Unsigned(s[4]); // Left X (Usage 0x30)
+                  r[4] = axis8Unsigned(s[5]); // Left Y (Usage 0x31)
+                  r[5] = axis8Unsigned(s[6]); // Right X (Usage 0x32 / Z)
+                  r[6] = axis8Unsigned(s[7]); // Right Y (Usage 0x35 / Rz)
+                  r[7] = s[8];                // L2 (Usage 0x33 / Rx, 0..255)
+                  r[8] = s[9];                // R2 (Usage 0x34 / Ry, 0..255)
                   return r;
               }
 
@@ -1312,24 +1562,27 @@ jobs:
                   if ((mask & L3) != 0) btn |= 1 << 13;
                   if ((mask & R3) != 0) btn |= 1 << 14;
                   byte[] r = new byte[16];
-                  put16(r, 0, axis16(s[4])); put16(r, 2, axis16(s[5]));
-                  put16(r, 4, axis16(s[6])); put16(r, 6, axis16(s[7]));
+                  put16(r, 0, axis16Unsigned(s[4])); // Left X (0x30)
+                  put16(r, 2, axis16Unsigned(s[5])); // Left Y (0x31)
+                  put16(r, 4, axis16Unsigned(s[6])); // Right X (0x32 / Z)
+                  put16(r, 6, axis16Unsigned(s[7])); // Right Y (0x35 / Rz)
                   put16(r, 8, (s[8] & 0xFF) * 1023 / 255);
                   put16(r, 10, (s[9] & 0xFF) * 1023 / 255);
-                  r[12] = (byte)hat(mask);
-                  r[13] = (byte)(btn & 0xFF); r[14] = (byte)((btn >> 8) & 0xFF);
+                  r[12] = (byte) hat(mask);
+                  r[13] = (byte) (btn & 0xFF);
+                  r[14] = (byte) ((btn >> 8) & 0xFF);
                   r[15] = 0;
                   return r;
               }
 
               private byte[] buildPs5Report(int mask, byte[] s) {
-                  // DualSense BT Report 1 basic payload; report ID is supplied separately.
                   byte[] r = new byte[9];
-                  r[0] = (byte)((s[4] & 0xFF) + 128); // X
-                  r[1] = (byte)((s[5] & 0xFF) + 128); // Y
-                  r[2] = s[8];                           // Z / L2
-                  r[3] = s[9];                           // Rz / R2
-                  int b0 = hat(mask) & 0x0F;
+                  // 修复原先 (s[i] & 0xFF) + 128 对负数算错的 Bug，使用有符号扩展 + 128
+                  r[0] = axis8Unsigned(s[4]); // Left X (0x30)
+                  r[1] = axis8Unsigned(s[5]); // Left Y (0x31)
+                  r[2] = axis8Unsigned(s[6]); // Right X (0x32 / Z)
+                  r[3] = axis8Unsigned(s[7]); // Right Y (0x35 / Rz)
+                  int b0 = hatPs5(mask) & 0x0F;
                   if ((mask & X) != 0) b0 |= 1 << 4; // Square
                   if ((mask & A) != 0) b0 |= 1 << 5; // Cross
                   if ((mask & B) != 0) b0 |= 1 << 6; // Circle
@@ -1343,24 +1596,15 @@ jobs:
                   if ((mask & START) != 0) b1 |= 1 << 5;
                   if ((mask & L3) != 0) b1 |= 1 << 6;
                   if ((mask & R3) != 0) b1 |= 1 << 7;
-                  r[4] = (byte)b0;
-                  r[5] = (byte)b1;
-                  r[6] = (byte)((mask & HOME) != 0 ? 1 : 0);
-                  r[7] = (byte)((s[6] & 0xFF) + 128); // Rx
-                  r[8] = (byte)((s[7] & 0xFF) + 128); // Ry
+                  r[4] = (byte) b0;
+                  r[5] = (byte) b1;
+                  r[6] = (byte) ((mask & HOME) != 0 ? 1 : 0);
+                  r[7] = s[8]; // L2 analog (0x33 / Rx)
+                  r[8] = s[9]; // R2 analog (0x34 / Ry)
                   return r;
               }
 
-              private static void put12(byte[] r, int off, int x, int y) {
-                  r[off] = (byte)(x & 0xFF);
-                  r[off + 1] = (byte)(((x >> 8) & 0x0F) | ((y & 0x0F) << 4));
-                  r[off + 2] = (byte)((y >> 4) & 0xFF);
-              }
-
-              private int reportCounter = 0;
-
               private byte[] buildSwitchReport(int mask, byte[] s) {
-                  // Switch-style standard HID: 24 buttons + 4 unsigned 16-bit axes + 2 padding bytes.
                   byte[] r = new byte[13];
                   int rb = 0, sb = 0, lb = 0;
                   if ((mask & Y) != 0) rb |= 0x01;
@@ -1380,13 +1624,16 @@ jobs:
                   if ((mask & LEFT) != 0) lb |= 0x08;
                   if ((mask & L1) != 0) lb |= 0x40;
                   if ((mask & L2) != 0) lb |= 0x80;
-                  r[0] = (byte)rb; r[1] = (byte)sb; r[2] = (byte)lb;
-                  int lx = 32768 + Math.round(s[4] / 127f * 32767f);
-                  int ly = 32768 + Math.round(-s[5] / 127f * 32767f);
-                  int rx = 32768 + Math.round(s[6] / 127f * 32767f);
-                  int ry = 32768 + Math.round(-s[7] / 127f * 32767f);
-                  put16(r, 3, lx); put16(r, 5, ly); put16(r, 7, rx); put16(r, 9, ry);
-                  r[11] = 0; r[12] = 0;
+                  r[0] = (byte) rb;
+                  r[1] = (byte) sb;
+                  r[2] = (byte) lb;
+                  // 与标准 HID Y 轴方向保持一致 (向上为减小，向下为增大)，全部使用 0..65535 无符号
+                  put16(r, 3, axis16Unsigned(s[4]));
+                  put16(r, 5, axis16Unsigned(s[5]));
+                  put16(r, 7, axis16Unsigned(s[6]));
+                  put16(r, 9, axis16Unsigned(s[7]));
+                  r[11] = 0;
+                  r[12] = 0;
                   return r;
               }
 
@@ -1397,21 +1644,21 @@ jobs:
                   int mask = (s[0] & 0xFF) | ((s[1] & 0xFF) << 8) | ((s[2] & 0xFF) << 16) | ((s[3] & 0xFF) << 24);
                   byte[] r;
                   if ("dinput".equals(profile)) {
-                       r = buildDinputReport(mask, s);
-                   } else if ("ps5".equals(profile)) {
-                       r = buildPs5Report(mask, s);
-                   } else if ("switch".equals(profile)) {
-                       r = buildSwitchReport(mask, s);
-                   } else {
-                       r = buildXboxReport(mask, s);
-                   }
-                   long now = System.nanoTime();
+                      r = buildDinputReport(mask, s);
+                  } else if ("ps5".equals(profile)) {
+                      r = buildPs5Report(mask, s);
+                  } else if ("switch".equals(profile)) {
+                      r = buildSwitchReport(mask, s);
+                  } else {
+                      r = buildXboxReport(mask, s);
+                  }
+                  long now = System.nanoTime();
                   boolean same = r.length == lastLen && Arrays.equals(Arrays.copyOf(lastReport, lastLen), r);
                   if (same && now - lastSendNs < 500_000_000L) return;   // 无变化:仅 0.5s 心跳
-                  if (!same && now - lastSendNs < 2_000_000L) return;    // 最低 2ms 节流；蓝牙链路自身仍决定最终轮询频率
+                  if (!same && now - lastSendNs < 2_000_000L) return;    // 最低 2ms 节流
                   try {
                       int reportId = "switch".equals(profile) ? 0x30 : 1;
-                       if (h.sendReport(host, reportId, r)) {
+                      if (h.sendReport(host, reportId, r)) {
                           System.arraycopy(r, 0, lastReport, 0, r.length);
                           lastLen = r.length;
                           lastSendNs = now;
@@ -1422,6 +1669,8 @@ jobs:
           EOF
 
           cat << 'EOF' > patch_manifest.py
+          import glob
+
           p = "android/app/src/main/AndroidManifest.xml"
           s = open(p, encoding="utf-8").read()
           perms = (
@@ -1430,6 +1679,7 @@ jobs:
               '    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />\n'
               '    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n'
               '    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />\n'
+              '    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />\n'
               '    <application'
           )
           assert "<application" in s
@@ -1437,30 +1687,6 @@ jobs:
           print("manifest patched")
           EOF
           python3 patch_manifest.py
-
-          # Android 11+ (API 30) 基线；Android 12+ 仍使用 BLUETOOTH_CONNECT/ADVERTISE。
-          cat << 'EOF' > patch_android_sdk.py
-          from pathlib import Path
-          import re
-
-          # Flutter stable 的新 Android 模板可能使用 build.gradle.kts，
-          # 老模板使用 build.gradle；两种都兼容。
-          candidates = [Path("android/app/build.gradle.kts"), Path("android/app/build.gradle")]
-          p = next((x for x in candidates if x.exists()), None)
-          if p is None:
-              raise SystemExit("ERROR: android/app/build.gradle(.kts) not found")
-
-          s = p.read_text(encoding="utf-8")
-          if p.suffix == ".kts":
-              s = re.sub(r'minSdk\s*=\s*flutter\.minSdkVersion', 'minSdk = 30', s)
-              s = re.sub(r'targetSdk\s*=\s*flutter\.targetSdkVersion', 'targetSdk = 35', s)
-          else:
-              s = re.sub(r'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 30', s)
-              s = re.sub(r'targetSdkVersion\s+flutter\.targetSdkVersion', 'targetSdkVersion 35', s)
-          p.write_text(s, encoding="utf-8")
-          print(f"Android SDK patched: {p}")
-          EOF
-          python3 patch_android_sdk.py
 
           flutter build apk --release
       - name: Upload Android APK
@@ -1598,14 +1824,20 @@ jobs:
 
             bool _isEditLayoutMode = false;
             bool _isToolbarCollapsed = false;
-            bool _isRightStickSwipeMode = true;
+            bool _isRightStickSwipeMode = false; // 默认开启标准双摇杆回中模式，确保左右摇杆8向/360°映射正常
             bool _isGyroEnabled = false;
             bool _gyroHoldL2 = false;
             bool _gyroFlat = false;
             bool _gyroInvX = false;
             bool _gyroInvY = false;
+            bool _invertLeftX = false;
+            bool _invertLeftY = false;
+            bool _invertRightX = false;
+            bool _invertRightY = false;
+            bool _swapLeftAxes = false;
+            bool _swapRightAxes = false;
             int _labelStyle = 0; // 0 Xbox, 1 PS, 2 Switch(仅影响屏幕上的按键标签)
-            String _hidProfile = 'xbox'; // xbox | dinput
+            String _hidProfile = 'xbox'; // xbox | dinput | ps5 | switch
             String _btStatus = '未连接 (点蓝牙图标)';
             String? _selectedWidgetId;
 
@@ -1618,28 +1850,35 @@ jobs:
             final Set<String> _pressedButtons = {};
             Offset _leftStickPos = Offset.zero;
             Offset _rightStickPos = Offset.zero;
+            Offset _previewLeft = Offset.zero;
             Offset _previewRight = Offset.zero;
+            int? _leftStickPointer;
+            int? _rightStickPointer;
+            int? _swipePointer;
             double _swipeAccX = 0, _swipeAccY = 0;
             Offset _swipeVel = Offset.zero;
             List<double> _lastGyro = [0, 0, 0, 1];
             bool _busy = false;
             bool _again = false;
+            bool _sendQueued = false;
 
             Timer? _sendTimer;
+            Timer? _inputTicker;
             Timer? _uiTimer;
             late List<PadWidgetConfig> _layoutConfigs;
 
             @override
             void initState() {
+              _startInputTicker();
               super.initState();
               _layoutConfigs = defaultLayout();
               _loadSavedLayout();
-              _sendTimer = Timer.periodic(const Duration(milliseconds: 8), (_) => _requestSend());
               _uiTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) => _refreshStatus());
             }
 
             @override
             void dispose() {
+              _inputTicker?.cancel();
               _sendTimer?.cancel();
               _uiTimer?.cancel();
               super.dispose();
@@ -1663,7 +1902,6 @@ jobs:
                 if (saved != null && saved.isNotEmpty) {
                   final List decoded = jsonDecode(saved) as List;
                   final loaded = decoded.map((e) => PadWidgetConfig.fromJson(Map<String, dynamic>.from(e as Map))).toList();
-                  // 旧版本保存的布局里没有的新按键,用默认位置补上
                   for (final d in defaultLayout()) {
                     if (!loaded.any((e) => e.id == d.id)) loaded.add(d);
                   }
@@ -1678,13 +1916,24 @@ jobs:
               } catch (_) {}
             }
 
-            Offset _curve(Offset raw, double sens) {
-              final double mag = raw.distance;
-              if (mag <= _stickDeadzone) return Offset.zero;
+            /// 独立 X/Y 双轴死区与响应曲线处理，兼顾正交4向与斜向4向（完整8方向+360°无极坐标耦合）
+            Offset _curve(Offset raw, double sens, {bool invX = false, bool invY = false, bool swapAxes = false}) {
+              double rx = swapAxes ? raw.dy : raw.dx;
+              double ry = swapAxes ? raw.dx : raw.dy;
+              if (invX) rx = -rx;
+              if (invY) ry = -ry;
+
+              final double mag = math.sqrt(rx * rx + ry * ry);
+              if (mag <= _stickDeadzone || mag == 0.0) return Offset.zero;
+
               final double n = ((mag - _stickDeadzone) / (1.0 - _stickDeadzone)).clamp(0.0, 1.0);
-              final double c = (math.pow(n, 1.2) * sens).clamp(0.0, 1.0).toDouble();
-              final double a = math.atan2(raw.dy, raw.dx);
-              return Offset(math.cos(a) * c, math.sin(a) * c);
+              final double c = (math.pow(n, 1.15) * sens).clamp(0.0, 1.0).toDouble();
+              final double ux = rx / mag;
+              final double uy = ry / mag;
+              return Offset(
+                (ux * c).clamp(-1.0, 1.0).toDouble(),
+                (uy * c).clamp(-1.0, 1.0).toDouble(),
+              );
             }
 
             Offset _gyroOutput() {
@@ -1692,7 +1941,6 @@ jobs:
               if (_gyroHoldL2 && !_pressedButtons.contains('BTN_L2')) return Offset.zero;
               final gx = _lastGyro[0], gy = _lastGyro[1], gz = _lastGyro[2], s = _lastGyro[3];
               double dz(double v) => v.abs() < 0.03 ? 0.0 : v;
-              // 掌机式横握:左右转身 = 绕 x 轴;平放:绕 z 轴
               double yaw = _gyroFlat ? -dz(gz) : -dz(gx) * s;
               double pitch = dz(gy) * s;
               if (_gyroInvX) yaw = -yaw;
@@ -1701,13 +1949,28 @@ jobs:
               return Offset(yaw * k, pitch * k);
             }
 
-            /// 任何输入变化立刻请求发送;发送中又有新变化则合并成"发完再发一次最新状态",不排队。
             void _requestSend() {
-              if (_busy) { _again = true; return; }
-              _pump();
+              if (_isEditLayoutMode || _sendQueued) return;
+              _sendQueued = true;
+              _sendTimer?.cancel();
+              _sendTimer = Timer(const Duration(milliseconds: 2), () {
+                _sendQueued = false;
+                _pump();
+              });
+            }
+
+            void _startInputTicker() {
+              _inputTicker?.cancel();
+              _inputTicker = Timer.periodic(const Duration(milliseconds: 4), (_) {
+                if (!_isEditLayoutMode) _requestSend();
+              });
             }
 
             Future<void> _pump() async {
+              if (_busy) {
+                _again = true;
+                return;
+              }
               _busy = true;
               try {
                 do {
@@ -1723,19 +1986,36 @@ jobs:
               if (_isEditLayoutMode) return;
               try {
                 if (_isRightStickSwipeMode) {
-                  final ix = _swipeAccX / 18.0 * _swipeViewSensitivity;
-                  final iy = _swipeAccY / 18.0 * _swipeViewSensitivity;
-                  _swipeVel = Offset(_swipeVel.dx * 0.5 + ix * 0.5, _swipeVel.dy * 0.5 + iy * 0.5);
+                  final ix = (_invertRightX ? -_swipeAccX : _swipeAccX) / 18.0 * _swipeViewSensitivity;
+                  final iy = (_invertRightY ? -_swipeAccY : _swipeAccY) / 18.0 * _swipeViewSensitivity;
+                  final sx = _swapRightAxes ? iy : ix;
+                  final sy = _swapRightAxes ? ix : iy;
+                  _swipeVel = Offset(_swipeVel.dx * 0.45 + sx * 0.55, _swipeVel.dy * 0.45 + sy * 0.55);
                 } else {
                   _swipeVel = Offset.zero;
                 }
                 _swipeAccX = 0;
                 _swipeAccY = 0;
 
-                final left = _curve(_leftStickPos, _leftStickSensitivity);
-                final base = _isRightStickSwipeMode ? _swipeVel : _curve(_rightStickPos, _rightStickSensitivity);
+                final left = _curve(
+                  _leftStickPos,
+                  _leftStickSensitivity,
+                  invX: _invertLeftX,
+                  invY: _invertLeftY,
+                  swapAxes: _swapLeftAxes,
+                );
+                final base = _isRightStickSwipeMode
+                    ? _swipeVel
+                    : _curve(
+                        _rightStickPos,
+                        _rightStickSensitivity,
+                        invX: _invertRightX,
+                        invY: _invertRightY,
+                        swapAxes: _swapRightAxes,
+                      );
                 final g = _gyroOutput();
                 final right = Offset((base.dx + g.dx).clamp(-1.0, 1.0).toDouble(), (base.dy + g.dy).clamp(-1.0, 1.0).toDouble());
+                _previewLeft = left;
                 _previewRight = right;
 
                 int mask = 0;
@@ -1754,10 +2034,11 @@ jobs:
                 bd.setUint8(8, _pressedButtons.contains('BTN_L2') ? 255 : 0);
                 bd.setUint8(9, _pressedButtons.contains('BTN_R2') ? 255 : 0);
 
-                final res = await _ch.invokeMethod<List<dynamic>>('sendState', p);
-                if (res != null && res.length >= 4) {
-                  _lastGyro = res.map((e) => (e as num).toDouble()).toList();
-                }
+                unawaited(_ch.invokeMethod<List<dynamic>>('sendState', p).then((res) {
+                  if (res != null && res.length >= 4) {
+                    _lastGyro = res.map((e) => (e as num).toDouble()).toList();
+                  }
+                }).catchError((_) {}));
               } catch (_) {}
             }
 
@@ -1789,15 +2070,22 @@ jobs:
                     shrinkWrap: true,
                     padding: const EdgeInsets.all(12),
                     children: [
-                      const Text('连接方式', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
+                      const Text('连接方式 (兼容 Android 11 ~ 15+)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
                       ListTile(
                         leading: const Icon(Icons.visibility),
                         title: const Text('让手机可被发现 (首次配对)'),
-                        subtitle: const Text('然后在电脑/平板/电视的蓝牙设置里搜索并配对本手机'),
+                        subtitle: const Text('然后在电脑/平板/电视/接收端手机的蓝牙设置里搜索并配对本手机'),
                         onTap: () async {
                           Navigator.pop(ctx);
                           try { await _ch.invokeMethod('makeDiscoverable'); } catch (_) {}
                         },
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                        child: Text(
+                          '提示：切换手柄协议或更新后，若发现方向异常，请先在接收端系统的蓝牙设置中“取消配对/忽略此设备”，再重新配对（防止系统缓存旧 HID 描述符）。',
+                          style: TextStyle(fontSize: 11, color: Colors.amberAccent),
+                        ),
                       ),
                       const Divider(color: Colors.white24),
                       if (bonded.isEmpty)
@@ -1831,16 +2119,29 @@ jobs:
                         top: 56,
                         right: 0,
                         bottom: 0,
-                        child: GestureDetector(
+                        child: Listener(
                           behavior: HitTestBehavior.translucent,
-                          onPanUpdate: _onSwipe,
+                          onPointerDown: (e) {
+                            _swipePointer ??= e.pointer;
+                          },
+                          onPointerMove: (e) {
+                            if (_swipePointer == e.pointer) {
+                              _onSwipeDelta(e.delta);
+                            }
+                          },
+                          onPointerUp: (e) {
+                            if (_swipePointer == e.pointer) _swipePointer = null;
+                          },
+                          onPointerCancel: (e) {
+                            if (_swipePointer == e.pointer) _swipePointer = null;
+                          },
                           child: Container(
                             decoration: const BoxDecoration(border: Border(left: BorderSide(color: Color(0x2600E5FF), width: 1))),
                             alignment: Alignment.bottomRight,
                             padding: const EdgeInsets.all(16),
-                            child: Text(
+                            child: const Text(
                               '3D 自由滑屏视角区',
-                              style: const TextStyle(color: Color(0x7300E5FF), fontSize: 12),
+                              style: TextStyle(color: Color(0x7300E5FF), fontSize: 12),
                             ),
                           ),
                         ),
@@ -1880,10 +2181,11 @@ jobs:
               );
             }
 
-            void _onSwipe(DragUpdateDetails d) {
+            void _onSwipeDelta(Offset delta) {
               if (_isEditLayoutMode) return;
-              _swipeAccX += d.delta.dx;
-              _swipeAccY += d.delta.dy;
+              _swipeAccX += delta.dx;
+              _swipeAccY += delta.dy;
+              _requestSend();
             }
 
             Widget _buildTopToolbar() {
@@ -1902,8 +2204,20 @@ jobs:
                     ),
                     Flexible(
                       flex: 2,
-                      child: Text(_btStatus, maxLines: 1, overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 12, color: Colors.white70)),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(_btStatus, maxLines: 1, overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 11, color: Colors.white70)),
+                          Text(
+                            'L(${_previewLeft.dx.toStringAsFixed(2)}, ${_previewLeft.dy.toStringAsFixed(2)})  R(${_previewRight.dx.toStringAsFixed(2)}, ${_previewRight.dy.toStringAsFixed(2)})',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 10, color: Colors.cyanAccent),
+                          ),
+                        ],
+                      ),
                     ),
                     const SizedBox(width: 8),
                     Expanded(
@@ -1957,15 +2271,29 @@ jobs:
               Widget child;
               if (cfg.id == 'LEFT_STICK') {
                 child = _buildAnalogStick(
-                  size: finalSize, label: 'L', value: _leftStickPos,
-                  onChanged: (v) { setState(() => _leftStickPos = v); _requestSend(); },
+                  size: finalSize,
+                  label: 'L',
+                  value: _leftStickPos,
+                  activePointer: _leftStickPointer,
+                  onPointerChanged: (p) => _leftStickPointer = p,
+                  onChanged: (v) {
+                    setState(() => _leftStickPos = v);
+                    _requestSend();
+                  },
                 );
               } else if (cfg.id == 'RIGHT_STICK') {
                 child = _isRightStickSwipeMode
                     ? _buildSwipeZone(finalSize)
                     : _buildAnalogStick(
-                        size: finalSize, label: 'R', value: _rightStickPos,
-                        onChanged: (v) { setState(() => _rightStickPos = v); _requestSend(); },
+                        size: finalSize,
+                        label: 'R',
+                        value: _rightStickPos,
+                        activePointer: _rightStickPointer,
+                        onPointerChanged: (p) => _rightStickPointer = p,
+                        onChanged: (v) {
+                          setState(() => _rightStickPos = v);
+                          _requestSend();
+                        },
                       );
               } else {
                 child = _buildActionButton(cfg.fn, _label(cfg.fn), finalSize);
@@ -1997,10 +2325,14 @@ jobs:
               );
             }
 
+            /// 使用底层 Listener + 独立 pointerId 跟踪代替 GestureDetector(onPan)，
+            /// 彻底解决多指触控冲突、全屏滑屏手势抢夺以及正交/斜向 8 方向死锁问题。
             Widget _buildAnalogStick({
               required double size,
               required String label,
               required Offset value,
+              required int? activePointer,
+              required ValueChanged<int?> onPointerChanged,
               required ValueChanged<Offset> onChanged,
             }) {
               final double radius = size / 2;
@@ -2008,39 +2340,50 @@ jobs:
               final double maxDist = math.max(1.0, radius - knob);
 
               void update(Offset local) {
-                // X/Y 必须分别计算，不能把两个轴耦合在一起。
-                // 同时采用径向限幅，保证圆周边缘仍能得到完整的 ±1 范围。
-                final Offset delta = local - Offset(radius, radius);
+                final double dx = local.dx - radius;
+                final double dy = local.dy - radius;
+                final double dist = math.sqrt(dx * dx + dy * dy);
 
-                // X/Y 两个轴独立计算，避免部分触控/HID 解析路径把两个轴耦合成
-                // “左上/右下”两条对角线；最后只做圆形限幅。
-                double x = (delta.dx / maxDist).clamp(-1.0, 1.0).toDouble();
-                double y = (delta.dy / maxDist).clamp(-1.0, 1.0).toDouble();
-
-                const double dead = 0.055;
-                double remap(double v) {
-                  final double a = v.abs();
-                  if (a <= dead) return 0.0;
-                  final double m = ((a - dead) / (1.0 - dead)).clamp(0.0, 1.0).toDouble();
-                  return v.isNegative ? -m : m;
+                double nx;
+                double ny;
+                if (dist > maxDist && dist > 0.0) {
+                  nx = dx / dist;
+                  ny = dy / dist;
+                } else {
+                  nx = dx / maxDist;
+                  ny = dy / maxDist;
                 }
-                x = remap(x);
-                y = remap(y);
 
-                final double mag = math.sqrt(x * x + y * y);
-                if (mag > 1.0) {
-                  x /= mag;
-                  y /= mag;
-                }
-                onChanged(Offset(x, y));
+                nx = nx.clamp(-1.0, 1.0).toDouble();
+                ny = ny.clamp(-1.0, 1.0).toDouble();
+                onChanged(Offset(nx, ny));
               }
 
-              return GestureDetector(
+              return Listener(
                 behavior: HitTestBehavior.opaque,
-                onPanStart: (d) => update(d.localPosition),
-                onPanUpdate: (d) => update(d.localPosition),
-                onPanEnd: (_) { onChanged(Offset.zero); _requestSend(); },
-                onPanCancel: () { onChanged(Offset.zero); _requestSend(); },
+                onPointerDown: (PointerDownEvent e) {
+                  if (activePointer == null) {
+                    onPointerChanged(e.pointer);
+                    update(e.localPosition);
+                  }
+                },
+                onPointerMove: (PointerMoveEvent e) {
+                  if (activePointer == e.pointer) {
+                    update(e.localPosition);
+                  }
+                },
+                onPointerUp: (PointerUpEvent e) {
+                  if (activePointer == e.pointer) {
+                    onPointerChanged(null);
+                    onChanged(Offset.zero);
+                  }
+                },
+                onPointerCancel: (PointerCancelEvent e) {
+                  if (activePointer == e.pointer) {
+                    onPointerChanged(null);
+                    onChanged(Offset.zero);
+                  }
+                },
                 child: Container(
                   width: size,
                   height: size,
@@ -2049,29 +2392,49 @@ jobs:
                     color: const Color(0x14FFFFFF),
                     border: Border.all(color: const Color(0x6600E5FF), width: 2),
                   ),
-                  child: Center(
-                    child: Transform.translate(
-                      offset: Offset(value.dx * (radius - knob), value.dy * (radius - knob)),
-                      child: Container(
-                        width: knob * 2,
-                        height: knob * 2,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Color(0xBF00E5FF),
-                          boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      // 十字与八向参考刻度线，方便直观确认上下左右与斜向输出
+                      Container(width: size * 0.82, height: 1, color: const Color(0x2200E5FF)),
+                      Container(width: 1, height: size * 0.82, color: const Color(0x2200E5FF)),
+                      Transform.translate(
+                        offset: Offset(value.dx * maxDist, value.dy * maxDist),
+                        child: Container(
+                          width: knob * 2,
+                          height: knob * 2,
+                          decoration: const BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Color(0xBF00E5FF),
+                            boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
+                          ),
+                          alignment: Alignment.center,
+                          child: Text(label, style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
                         ),
-                        alignment: Alignment.center,
-                        child: Text(label, style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
                       ),
-                    ),
+                    ],
                   ),
                 ),
               );
             }
 
             Widget _buildSwipeZone(double size) {
-              return GestureDetector(
-                onPanUpdate: _onSwipe,
+              return Listener(
+                behavior: HitTestBehavior.opaque,
+                onPointerDown: (e) {
+                  _swipePointer ??= e.pointer;
+                },
+                onPointerMove: (e) {
+                  if (_swipePointer == e.pointer) {
+                    _onSwipeDelta(e.delta);
+                  }
+                },
+                onPointerUp: (e) {
+                  if (_swipePointer == e.pointer) _swipePointer = null;
+                },
+                onPointerCancel: (e) {
+                  if (_swipePointer == e.pointer) _swipePointer = null;
+                },
                 child: Container(
                   width: size * 1.25,
                   height: size,
@@ -2175,30 +2538,38 @@ jobs:
                             crossAxisAlignment: CrossAxisAlignment.start,
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              const Text('设置', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
+                              const Text('设置 (兼容 Android 11+ 全向摇杆映射)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
                               const Divider(color: Colors.white24),
                               const Text('手柄协议(蓝牙发给主机的类型)', style: TextStyle(fontSize: 13)),
                               RadioListTile<String>(
                                 dense: true,
-                                title: const Text('Xbox 手柄布局 (Xbox One S 蓝牙描述符)'),
-                                subtitle: const Text('Android/Linux/多数安卓游戏按 Xbox 手柄识别'),
+                                title: const Text('Xbox / XInput 兼容 (推荐 Android 11+ / Windows)'),
+                                subtitle: const Text('独立 4 轴 16-bit 摇杆 (X/Y + Z/Rz) + LT/RT，彻底解决左上/右下对角坍缩'),
                                 value: 'xbox', groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
                               RadioListTile<String>(
                                 dense: true,
-                                title: const Text('通用 DirectInput 手柄'),
-                                subtitle: const Text('Windows 老游戏 / 模拟器'),
+                                title: const Text('DirectInput 通用'),
+                                subtitle: const Text('标准 8-bit 独立双摇杆 (X/Y + Z/Rz) + 扳机 (Rx/Ry)，兼容模拟器与映射器'),
                                 value: 'dinput', groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
-                              const ListTile(
+                              RadioListTile<String>(
                                 dense: true,
-                                enabled: false,
-                                title: Text('PS5 DualSense / Switch Pro (真机协议)'),
-                                subtitle: Text('暂未实现:需要专用握手协议,见说明'),
+                                title: const Text('PS5 DualSense 兼容'),
+                                subtitle: const Text('无符号 8-bit 独立双摇杆 (0..255 中心 128)，修复负数符号截断'),
+                                value: 'ps5', groupValue: _hidProfile,
+                                onChanged: (v) => both(() => _hidProfile = v!),
                               ),
-                              const Text('切换协议后,点蓝牙图标重新启动;主机端需删除旧配对再重新配对。',
+                              RadioListTile<String>(
+                                dense: true,
+                                title: const Text('Switch Pro 兼容'),
+                                subtitle: const Text('16-bit 独立四轴标准 HID 布局'),
+                                value: 'switch', groupValue: _hidProfile,
+                                onChanged: (v) => both(() => _hidProfile = v!),
+                              ),
+                              const Text('切换协议后请点顶部蓝牙图标重启 HID，并在接收端删除旧蓝牙配对后重新连接。',
                                   style: TextStyle(fontSize: 11, color: Colors.amberAccent)),
                               const SizedBox(height: 8),
                               const Text('屏幕按键样式(只改标签和位置含义,不改协议)', style: TextStyle(fontSize: 13)),
@@ -2214,6 +2585,7 @@ jobs:
                               SwitchListTile(
                                 dense: true,
                                 title: const Text('右摇杆改为“3D手游随意滑屏控制视角”'),
+                                subtitle: const Text('映射按键/校准摇杆时请关闭此项，使用传统回中右摇杆'),
                                 value: _isRightStickSwipeMode,
                                 onChanged: (v) => both(() => _isRightStickSwipeMode = v),
                               ),
@@ -2221,6 +2593,14 @@ jobs:
                               _slider('右摇杆(传统)灵敏度', _rightStickSensitivity, 0.2, 2.5, (v) => both(() => _rightStickSensitivity = v)),
                               _slider('右摇杆(滑屏视角)灵敏度', _swipeViewSensitivity, 0.3, 4.0, (v) => both(() => _swipeViewSensitivity = v)),
                               _slider('摇杆中心死区', _stickDeadzone, 0.0, 0.30, (v) => both(() => _stickDeadzone = v)),
+                              const Divider(color: Colors.white24),
+                              const Text('摇杆轴向修正 (适配不同游戏/映射器坐标系)', style: TextStyle(fontSize: 13, color: Colors.cyanAccent)),
+                              SwitchListTile(dense: true, title: const Text('左摇杆 X 轴反向 (左右对调)'), value: _invertLeftX, onChanged: (v) => both(() => _invertLeftX = v)),
+                              SwitchListTile(dense: true, title: const Text('左摇杆 Y 轴反向 (上下对调)'), value: _invertLeftY, onChanged: (v) => both(() => _invertLeftY = v)),
+                              SwitchListTile(dense: true, title: const Text('左摇杆 X/Y 轴互换'), value: _swapLeftAxes, onChanged: (v) => both(() => _swapLeftAxes = v)),
+                              SwitchListTile(dense: true, title: const Text('右摇杆 X 轴反向 (左右对调)'), value: _invertRightX, onChanged: (v) => both(() => _invertRightX = v)),
+                              SwitchListTile(dense: true, title: const Text('右摇杆 Y 轴反向 (上下对调)'), value: _invertRightY, onChanged: (v) => both(() => _invertRightY = v)),
+                              SwitchListTile(dense: true, title: const Text('右摇杆 X/Y 轴互换'), value: _swapRightAxes, onChanged: (v) => both(() => _swapRightAxes = v)),
                               const Divider(color: Colors.white24),
                               SwitchListTile(dense: true, title: const Text('陀螺仪体感(叠加到右摇杆)'), value: _isGyroEnabled, onChanged: (v) => both(() => _isGyroEnabled = v)),
                               _slider('体感灵敏度', _gyroSensitivity, 0.1, 4.0, (v) => both(() => _gyroSensitivity = v)),
