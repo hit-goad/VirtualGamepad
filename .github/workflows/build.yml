@@ -18,7 +18,7 @@ jobs:
           channel: 'stable'
       - name: Generate Project and Build APK
         run: |
-          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a kotlin -i swift app_build
+          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
           cd app_build
 
           cat << 'EOF' > lib/main.dart
@@ -657,179 +657,179 @@ jobs:
           }
           EOF
 
-          mkdir -p android/app/src/main/kotlin/com/example/virtual_gamepad
-          cat << 'EOF' > android/app/src/main/kotlin/com/example/virtual_gamepad/MainActivity.kt
-          package com.example.virtual_gamepad
+          cat << 'EOF' > android/app/src/main/java/com/example/virtual_gamepad/MainActivity.java
+          package com.example.virtual_gamepad;
 
-          import android.annotation.SuppressLint
-          import android.annotation.TargetApi
-          import android.bluetooth.*
-          import android.content.Context
-          import android.hardware.Sensor
-          import android.hardware.SensorEvent
-          import android.hardware.SensorEventListener
-          import android.hardware.SensorManager
-          import android.os.Build
-          import io.flutter.embedding.android.FlutterActivity
-          import io.flutter.embedding.engine.FlutterEngine
-          import io.flutter.plugin.common.MethodChannel
-          import java.util.concurrent.Executors
+          import android.annotation.SuppressLint;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothHidDevice;
+          import android.bluetooth.BluetoothHidDeviceAppSdpSettings;
+          import android.bluetooth.BluetoothManager;
+          import android.bluetooth.BluetoothProfile;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.hardware.Sensor;
+          import android.hardware.SensorEvent;
+          import android.hardware.SensorEventListener;
+          import android.hardware.SensorManager;
+          import android.os.Build;
+          import io.flutter.embedding.android.FlutterActivity;
+          import io.flutter.embedding.engine.FlutterEngine;
+          import io.flutter.plugin.common.MethodChannel;
+          import java.util.Arrays;
+          import java.util.concurrent.Executors;
 
-          @TargetApi(Build.VERSION_CODES.P)
-          @SuppressLint("MissingPermission", "NewApi")
-          class MainActivity : FlutterActivity(), SensorEventListener {
-              private val CHANNEL = "com.gamepad.hid/bluetooth"
-              private var hidDevice: BluetoothHidDevice? = null
-              private var hostDevice: BluetoothDevice? = null
-              private var sensorManager: SensorManager? = null
-              private var gyroX = 0.0
-              private var gyroY = 0.0
-              private var gyroZ = 0.0
+          @SuppressLint({"MissingPermission", "NewApi"})
+          public class MainActivity extends FlutterActivity implements SensorEventListener {
+              private static final String CHANNEL = "com.gamepad.hid/bluetooth";
+              private BluetoothHidDevice hidDevice;
+              private BluetoothDevice hostDevice;
+              private double gyroX = 0.0;
+              private double gyroY = 0.0;
+              private double gyroZ = 0.0;
 
-              private val HID_REPORT_DESC = byteArrayOf(
-                  0x05.toByte(), 0x01.toByte(),
-                  0x09.toByte(), 0x05.toByte(),
-                  0xA1.toByte(), 0x01.toByte(),
-                  0x85.toByte(), 0x01.toByte(),
-                  0x05.toByte(), 0x09.toByte(),
-                  0x19.toByte(), 0x01.toByte(),
-                  0x29.toByte(), 0x10.toByte(),
-                  0x15.toByte(), 0x00.toByte(),
-                  0x25.toByte(), 0x01.toByte(),
-                  0x75.toByte(), 0x01.toByte(),
-                  0x95.toByte(), 0x10.toByte(),
-                  0x81.toByte(), 0x02.toByte(),
-                  0x05.toByte(), 0x01.toByte(),
-                  0x09.toByte(), 0x30.toByte(),
-                  0x09.toByte(), 0x31.toByte(),
-                  0x09.toByte(), 0x32.toByte(),
-                  0x09.toByte(), 0x35.toByte(),
-                  0x15.toByte(), 0x81.toByte(),
-                  0x25.toByte(), 0x7F.toByte(),
-                  0x75.toByte(), 0x08.toByte(),
-                  0x95.toByte(), 0x04.toByte(),
-                  0x81.toByte(), 0x02.toByte(),
-                  0xC0.toByte()
-              )
+              private static final byte[] HID_REPORT_DESC = new byte[]{
+                  (byte) 0x05, (byte) 0x01,
+                  (byte) 0x09, (byte) 0x05,
+                  (byte) 0xA1, (byte) 0x01,
+                  (byte) 0x85, (byte) 0x01,
+                  (byte) 0x05, (byte) 0x09,
+                  (byte) 0x19, (byte) 0x01,
+                  (byte) 0x29, (byte) 0x10,
+                  (byte) 0x15, (byte) 0x00,
+                  (byte) 0x25, (byte) 0x01,
+                  (byte) 0x75, (byte) 0x01,
+                  (byte) 0x95, (byte) 0x10,
+                  (byte) 0x81, (byte) 0x02,
+                  (byte) 0x05, (byte) 0x01,
+                  (byte) 0x09, (byte) 0x30,
+                  (byte) 0x09, (byte) 0x31,
+                  (byte) 0x09, (byte) 0x32,
+                  (byte) 0x09, (byte) 0x35,
+                  (byte) 0x15, (byte) 0x81,
+                  (byte) 0x25, (byte) 0x7F,
+                  (byte) 0x75, (byte) 0x08,
+                  (byte) 0x95, (byte) 0x04,
+                  (byte) 0x81, (byte) 0x02,
+                  (byte) 0xC0
+              };
 
-              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-                  super.configureFlutterEngine(flutterEngine)
-                  sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-                  val gyroSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
-                  if (gyroSensor != null) {
-                      sensorManager?.registerListener(this, gyroSensor, SensorManager.SENSOR_DELAY_GAME)
-                  }
-                  val prefs = getSharedPreferences("gamepad_prefs", Context.MODE_PRIVATE)
-
-                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
-                      .setMethodCallHandler { call, result ->
-                          when (call.method) {
-                              "getGyro" -> result.success(listOf(gyroX, gyroY, gyroZ))
-                              "saveLayout" -> {
-                                  val jsonStr = call.arguments as? String
-                                  if (jsonStr != null) {
-                                      prefs.edit().putString("custom_gamepad_layout_v1", jsonStr).apply()
-                                  }
-                                  result.success(true)
-                              }
-                              "loadLayout" -> result.success(prefs.getString("custom_gamepad_layout_v1", null))
-                              "startHidProfile" -> initBluetoothHid(result)
-                              "sendHidReport" -> {
-                                  val bytes = call.arguments as? ByteArray
-                                  val dev = hidDevice
-                                  val host = hostDevice
-                                  if (bytes != null && bytes.size >= 7 && dev != null && host != null) {
-                                      val reportId = bytes[0].toInt()
-                                      val payload = bytes.copyOfRange(1, 7)
-                                      dev.sendReport(host, reportId, payload)
-                                  }
-                                  result.success(null)
-                              }
-                              else -> result.notImplemented()
-                          }
+              @Override
+              public void configureFlutterEngine(FlutterEngine flutterEngine) {
+                  super.configureFlutterEngine(flutterEngine);
+                  SensorManager sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+                  if (sensorManager != null) {
+                      Sensor gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+                      if (gyroSensor != null) {
+                          sensorManager.registerListener(this, gyroSensor, SensorManager.SENSOR_DELAY_GAME);
                       }
+                  }
+                  SharedPreferences prefs = getSharedPreferences("gamepad_prefs", Context.MODE_PRIVATE);
+
+                  new MethodChannel(flutterEngine.getDartExecutor().getBinaryMessenger(), CHANNEL)
+                      .setMethodCallHandler((call, result) -> {
+                          switch (call.method) {
+                              case "getGyro":
+                                  result.success(Arrays.asList(gyroX, gyroY, gyroZ));
+                                  break;
+                              case "saveLayout":
+                                  if (call.arguments instanceof String) {
+                                      prefs.edit().putString("custom_gamepad_layout_v1", (String) call.arguments).apply();
+                                  }
+                                  result.success(true);
+                                  break;
+                              case "loadLayout":
+                                  result.success(prefs.getString("custom_gamepad_layout_v1", null));
+                                  break;
+                              case "startHidProfile":
+                                  initBluetoothHid(result);
+                                  break;
+                              case "sendHidReport":
+                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && call.arguments instanceof byte[]) {
+                                      byte[] bytes = (byte[]) call.arguments;
+                                      if (bytes.length >= 7 && hidDevice != null && hostDevice != null) {
+                                          int reportId = bytes[0];
+                                          byte[] payload = Arrays.copyOfRange(bytes, 1, 7);
+                                          hidDevice.sendReport(hostDevice, reportId, payload);
+                                      }
+                                  }
+                                  result.success(null);
+                                  break;
+                              default:
+                                  result.notImplemented();
+                                  break;
+                          }
+                      });
               }
 
-              override fun onSensorChanged(event: SensorEvent?) {
-                  if (event?.sensor?.type == Sensor.TYPE_GYROSCOPE) {
-                      gyroX = event.values[0].toDouble()
-                      gyroY = event.values[1].toDouble()
-                      gyroZ = event.values[2].toDouble()
+              @Override
+              public void onSensorChanged(SensorEvent event) {
+                  if (event != null && event.sensor != null && event.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
+                      gyroX = event.values[0];
+                      gyroY = event.values[1];
+                      gyroZ = event.values[2];
                   }
               }
 
-              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+              @Override
+              public void onAccuracyChanged(Sensor sensor, int accuracy) {}
 
-              private fun initBluetoothHid(result: MethodChannel.Result) {
-                  val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-                  val adapter = btManager.adapter
+              private void initBluetoothHid(MethodChannel.Result result) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                      result.success("需要 Android 9.0 及以上系统支持蓝牙 HID");
+                      return;
+                  }
+                  BluetoothManager btManager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+                  BluetoothAdapter adapter = btManager != null ? btManager.getAdapter() : null;
                   if (adapter == null) {
-                      result.success("当前设备不支持蓝牙")
-                      return
+                      result.success("当前设备不支持蓝牙");
+                      return;
                   }
-                  adapter.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
-                      override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                          if (profile == BluetoothProfile.HID_DEVICE) {
-                              hidDevice = proxy as BluetoothHidDevice
-                              val sdp = BluetoothHidDeviceAppSdpSettings(
+                  adapter.getProfileProxy(this, new BluetoothProfile.ServiceListener() {
+                      @Override
+                      public void onServiceConnected(int profile, BluetoothProfile proxy) {
+                          if (profile == BluetoothProfile.HID_DEVICE && proxy instanceof BluetoothHidDevice) {
+                              hidDevice = (BluetoothHidDevice) proxy;
+                              BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
                                   "Pro Virtual Gamepad",
                                   "3D Swipe & Gyro Controller",
                                   "FlutterHID",
                                   BluetoothHidDevice.SUBCLASS1_COMBO,
                                   HID_REPORT_DESC
-                              )
-                              hidDevice?.registerApp(sdp, null, null, Executors.newSingleThreadExecutor(),
-                                  object : BluetoothHidDevice.Callback() {
-                                      override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
+                              );
+                              hidDevice.registerApp(sdp, null, null, Executors.newSingleThreadExecutor(),
+                                  new BluetoothHidDevice.Callback() {
+                                      @Override
+                                      public void onConnectionStateChanged(BluetoothDevice device, int state) {
                                           if (state == BluetoothProfile.STATE_CONNECTED) {
-                                              hostDevice = device
+                                              hostDevice = device;
                                           }
                                       }
-                                  })
-                              result.success("蓝牙 HID 已就绪，请在目标设备搜索连接")
+                                  });
                           }
                       }
-                      override fun onServiceDisconnected(profile: Int) {
-                          hidDevice = null
+
+                      @Override
+                      public void onServiceDisconnected(int profile) {
+                          hidDevice = null;
                       }
-                  }, BluetoothProfile.HID_DEVICE)
+                  }, BluetoothProfile.HID_DEVICE);
+                  result.success("蓝牙 HID 已就绪，请在目标设备搜索连接");
               }
           }
           EOF
 
-          cat << 'EOF' > android/app/src/main/AndroidManifest.xml
-          <manifest xmlns:android="[http://schemas.android.com/apk/res/android](http://schemas.android.com/apk/res/android)">
-              <uses-permission android:name="android.permission.BLUETOOTH" />
+          python3 -c '
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p).read()
+          perms = """<uses-permission android:name="android.permission.BLUETOOTH" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
-              <application
-                  android:label="Virtual Gamepad"
-                  android:name="${applicationName}"
-                  android:icon="@mipmap/ic_launcher">
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true"
-                      android:launchMode="singleTop"
-                      android:theme="@style/LaunchTheme"
-                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
-                      android:hardwareAccelerated="true"
-                      android:windowSoftInputMode="adjustResize">
-                      <meta-data
-                        android:name="io.flutter.embedding.android.NormalTheme"
-                        android:resource="@style/NormalTheme"
-                        />
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN"/>
-                          <category android:name="android.intent.category.LAUNCHER"/>
-                      </intent-filter>
-                  </activity>
-                  <meta-data
-                      android:name="flutterEmbedding"
-                      android:value="2" />
-              </application>
-          </manifest>
-          EOF
+              <application"""
+          open(p, "w").write(s.replace("<application", perms, 1))
+          '
 
           flutter build apk --release
       - name: Upload Android APK
@@ -847,7 +847,7 @@ jobs:
           channel: 'stable'
       - name: Generate Project and Build IPA
         run: |
-          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a kotlin -i swift app_build
+          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
           cd app_build
 
           cat << 'EOF' > lib/main.dart
