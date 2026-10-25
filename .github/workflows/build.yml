@@ -1,0 +1,63 @@
+name: Auto Build APK and IPA
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  # 任务 1：自动生成安卓工程并打包 APK
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+      - name: Auto Create Project and Build APK
+        run: |
+          flutter create --org com.example --project-name virtual_gamepad app_build
+          cd app_build
+          flutter pub add sensors_plus shared_preferences
+          cp ../main.dart lib/main.dart
+          sed -i 's/bluetooth_Connected/bluetooth_connected/g' lib/main.dart
+          cp ../MainActivity.kt android/app/src/main/kotlin/com/example/virtual_gamepad/MainActivity.kt
+          sed -i 's/<application/<uses-permission android:name="android.permission.BLUETOOTH" \/>\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" \/>\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" \/>\n    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" \/>\n    <application/' android/app/src/main/AndroidManifest.xml
+          flutter build apk --release
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-APK-Installer
+          path: app_build/build/app/outputs/flutter-apk/app-release.apk
+
+  # 任务 2：自动生成苹果 iOS 工程并打包 IPA
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+      - name: Auto Create Project and Build IPA
+        run: |
+          flutter create --org com.example --project-name virtual_gamepad app_build
+          cd app_build
+          flutter pub add sensors_plus shared_preferences
+          cp ../main.dart lib/main.dart
+          sed -i '' 's/bluetooth_Connected/bluetooth_connected/g' lib/main.dart
+          plutil -insert NSMotionUsageDescription -string "使用陀螺仪模拟原生体感控制" ios/Runner/Info.plist
+          plutil -insert NSBluetoothAlwaysUsageDescription -string "使用蓝牙连接目标设备映射按键" ios/Runner/Info.plist
+          flutter build ios --release --no-codesign
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r VirtualGamepad-iOS.ipa Payload
+      - name: Upload iOS IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-IPA-Installer
+          path: app_build/VirtualGamepad-iOS.ipa
