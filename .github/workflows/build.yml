@@ -116,7 +116,6 @@ jobs:
               super.initState();
               _initDefaultLayout();
               _loadSavedLayout();
-              // 极速 6ms 轮询推送，确保零延迟输入映射
               _hidReportTimer = Timer.periodic(const Duration(milliseconds: 6), (_) {
                 _pollNativeGyroAndSendReport();
               });
@@ -824,6 +823,1759 @@ jobs:
               }
           }
           EOF
+
+          # 自动向 build.gradle 注入 AGP 8+ 必需的 namespace
+          python3 -c '
+          gradle_path = "android/app/build.gradle"
+          content = open(gradle_path).read()
+          if "namespace" not in content:
+              content = content.replace("android {", "android {\n    namespace \"com.example.virtual_gamepad\"", 1)
+              open(gradle_path, "w").write(content)
+          '
+
+          python3 -c '
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p).read()
+          perms = """<uses-permission android:name="android.permission.BLUETOOTH" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <application"""
+          open(p, "w").write(s.replace("<application", perms, 1))
+          '
+
+          flutter build apk --release
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-APK-Installer
+          path: app_build/build/app/outputs/flutter-apk/app-release.apk
+
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+      - name: Build IPA
+        run: |
+          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
+          cd app_build
+          flutter build ios --release --no-codesign
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r VirtualGamepad-iOS.ipa Payload
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-IPA-Installer
+          path: app_build/VirtualGamepad-iOS.ipaname: Auto Build APK and IPA
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+      - name: Build APK
+        run: |
+          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
+          cd app_build
+
+          cat << 'EOF' > lib/main.dart
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:math' as math;
+          import 'dart:typed_data';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+
+          void main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await SystemChrome.setPreferredOrientations([
+              DeviceOrientation.landscapeLeft,
+              DeviceOrientation.landscapeRight,
+            ]);
+            await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+            runApp(const VirtualGamepadApp());
+          }
+
+          class VirtualGamepadApp extends StatelessWidget {
+            const VirtualGamepadApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'Pro Virtual Gamepad',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData.dark().copyWith(
+                  scaffoldBackgroundColor: const Color(0xFF121418),
+                  colorScheme: const ColorScheme.dark(primary: Color(0xFF00E5FF)),
+                ),
+                home: const GamepadScreen(),
+              );
+            }
+          }
+
+          class PadWidgetConfig {
+            final String id;
+            final String label;
+            double xRatio;
+            double yRatio;
+            double scale;
+
+            PadWidgetConfig({required this.id, required this.label, required this.xRatio, required this.yRatio, this.scale = 1.0});
+
+            Map<String, dynamic> toJson() => {'id': id, 'label': label, 'xRatio': xRatio, 'yRatio': yRatio, 'scale': scale};
+
+            factory PadWidgetConfig.fromJson(Map<String, dynamic> json) => PadWidgetConfig(
+                  id: json['id'],
+                  label: json['label'],
+                  xRatio: (json['xRatio'] as num).toDouble(),
+                  yRatio: (json['yRatio'] as num).toDouble(),
+                  scale: (json['scale'] as num).toDouble(),
+                );
+          }
+
+          class GamepadScreen extends StatefulWidget {
+            const GamepadScreen({super.key});
+
+            @override
+            State<GamepadScreen> createState() => _GamepadScreenState();
+          }
+
+          class _GamepadScreenState extends State<GamepadScreen> {
+            static const MethodChannel _btChannel = MethodChannel('com.gamepad.hid/bluetooth');
+
+            bool _isEditLayoutMode = false;
+            bool _isRightStickSwipeMode = true;
+            bool _isGyroEnabled = true;
+            bool _isNativeGyroHidMode = true;
+            String _selectedControllerProfile = 'XBOX';
+            String _btStatus = '蓝牙就绪 (点击连接)';
+            String? _selectedWidgetId;
+
+            double _leftStickSensitivity = 1.0;
+            double _rightStickSensitivity = 1.2;
+            double _swipeViewSensitivity = 1.8;
+            double _gyroSensitivity = 1.5;
+            double _stickDeadzone = 0.08;
+
+            final Set<String> _pressedButtons = {};
+            Offset _leftStickPos = Offset.zero;
+            Offset _rightStickPos = Offset.zero;
+            Offset _swipeDeltaOutput = Offset.zero;
+            Offset _gyroOffset = Offset.zero;
+            double _rawGyroX = 0.0, _rawGyroY = 0.0, _rawGyroZ = 0.0;
+
+            Timer? _hidReportTimer;
+            Timer? _swipeDecayTimer;
+            late List<PadWidgetConfig> _layoutConfigs;
+
+            @override
+            void initState() {
+              super.initState();
+              _initDefaultLayout();
+              _loadSavedLayout();
+              _hidReportTimer = Timer.periodic(const Duration(milliseconds: 6), (_) {
+                _pollNativeGyroAndSendReport();
+              });
+            }
+
+            @override
+            void dispose() {
+              _hidReportTimer?.cancel();
+              _swipeDecayTimer?.cancel();
+              super.dispose();
+            }
+
+            void _initDefaultLayout() {
+              _layoutConfigs = [
+                PadWidgetConfig(id: 'LEFT_STICK', label: '左摇杆', xRatio: 0.16, yRatio: 0.65, scale: 1.1),
+                PadWidgetConfig(id: 'RIGHT_STICK', label: '右视角区', xRatio: 0.78, yRatio: 0.65, scale: 1.15),
+                PadWidgetConfig(id: 'BTN_A', label: 'A', xRatio: 0.88, yRatio: 0.45, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_B', label: 'B', xRatio: 0.94, yRatio: 0.32, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_X', label: 'X', xRatio: 0.82, yRatio: 0.32, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_Y', label: 'Y', xRatio: 0.88, yRatio: 0.20, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_L1', label: 'L1', xRatio: 0.12, yRatio: 0.15, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_L2', label: 'L2', xRatio: 0.24, yRatio: 0.15, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_R1', label: 'R1', xRatio: 0.88, yRatio: 0.10, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_R2', label: 'R2', xRatio: 0.76, yRatio: 0.10, scale: 1.0),
+                PadWidgetConfig(id: 'DPAD_UP', label: '↑', xRatio: 0.32, yRatio: 0.45, scale: 0.9),
+                PadWidgetConfig(id: 'DPAD_DOWN', label: '↓', xRatio: 0.32, yRatio: 0.72, scale: 0.9),
+                PadWidgetConfig(id: 'DPAD_LEFT', label: '←', xRatio: 0.26, yRatio: 0.58, scale: 0.9),
+                PadWidgetConfig(id: 'DPAD_RIGHT', label: '→', xRatio: 0.38, yRatio: 0.58, scale: 0.9),
+              ];
+            }
+
+            Future<void> _loadSavedLayout() async {
+              try {
+                final String? savedJson = await _btChannel.invokeMethod<String>('loadLayout');
+                if (savedJson != null && savedJson.isNotEmpty) {
+                  final List decoded = jsonDecode(savedJson);
+                  setState(() {
+                    _layoutConfigs = decoded.map((e) => PadWidgetConfig.fromJson(e)).toList();
+                  });
+                }
+              } catch (_) {}
+            }
+
+            Future<void> _saveLayout() async {
+              try {
+                final encoded = jsonEncode(_layoutConfigs.map((e) => e.toJson()).toList());
+                await _btChannel.invokeMethod('saveLayout', encoded);
+              } catch (_) {}
+            }
+
+            Offset _applySensitivityCurve(Offset rawInput, double sensitivity) {
+              double mag = rawInput.distance;
+              if (mag <= _stickDeadzone) return Offset.zero;
+              double normalizedMag = ((mag - _stickDeadzone) / (1.0 - _stickDeadzone)).clamp(0.0, 1.0);
+              double curvedMag = (math.pow(normalizedMag, 1.2) * sensitivity).clamp(0.0, 1.0);
+              double angle = math.atan2(rawInput.dy, rawInput.dx);
+              return Offset(math.cos(angle) * curvedMag, math.sin(angle) * curvedMag);
+            }
+
+            void _onRightTouchpadPanUpdate(DragUpdateDetails details) {
+              if (_isEditLayoutMode) return;
+              const double basePixelScale = 16.0;
+              double dx = (details.delta.dx / basePixelScale) * _swipeViewSensitivity;
+              double dy = (details.delta.dy / basePixelScale) * _swipeViewSensitivity;
+              setState(() {
+                _swipeDeltaOutput = Offset(dx.clamp(-1.0, 1.0), dy.clamp(-1.0, 1.0));
+              });
+              _swipeDecayTimer?.cancel();
+              _swipeDecayTimer = Timer(const Duration(milliseconds: 18), () {
+                if (mounted) setState(() => _swipeDeltaOutput = Offset.zero);
+              });
+            }
+
+            Offset get _finalRightOutput {
+              Offset baseRight = _isRightStickSwipeMode
+                  ? _swipeDeltaOutput
+                  : _applySensitivityCurve(_rightStickPos, _rightStickSensitivity);
+              if (!_isGyroEnabled) return baseRight;
+              return Offset(
+                (baseRight.dx + _gyroOffset.dx).clamp(-1.0, 1.0),
+                (baseRight.dy + _gyroOffset.dy).clamp(-1.0, 1.0),
+              );
+            }
+
+            Future<void> _pollNativeGyroAndSendReport() async {
+              if (_isEditLayoutMode) return;
+
+              if (_isGyroEnabled) {
+                try {
+                  final List<dynamic>? gyro = await _btChannel.invokeMethod<List<dynamic>>('getGyro');
+                  if (gyro != null && gyro.length >= 3) {
+                    _rawGyroX = (gyro[0] as num).toDouble();
+                    _rawGyroY = (gyro[1] as num).toDouble();
+                    _rawGyroZ = (gyro[2] as num).toDouble();
+                    const double gyroDeadzone = 0.02;
+                    double yawRate = -_rawGyroZ;
+                    double pitchRate = -_rawGyroY;
+                    if (yawRate.abs() < gyroDeadzone) yawRate = 0.0;
+                    if (pitchRate.abs() < gyroDeadzone) pitchRate = 0.0;
+                    if (mounted) {
+                      setState(() {
+                        _gyroOffset = Offset(
+                          (yawRate * 0.25 * _gyroSensitivity).clamp(-1.0, 1.0),
+                          (pitchRate * 0.25 * _gyroSensitivity).clamp(-1.0, 1.0),
+                        );
+                      });
+                    }
+                  }
+                } catch (_) {}
+              } else {
+                _gyroOffset = Offset.zero;
+              }
+
+              final Offset leftOut = _applySensitivityCurve(_leftStickPos, _leftStickSensitivity);
+              final Offset rightOut = _finalRightOutput;
+
+              int buttonMask = 0;
+              const buttonOrder = [
+                'BTN_A', 'BTN_B', 'BTN_X', 'BTN_Y',
+                'BTN_L1', 'BTN_R1', 'BTN_L2', 'BTN_R2',
+                'DPAD_UP', 'DPAD_DOWN', 'DPAD_LEFT', 'DPAD_RIGHT'
+              ];
+              for (int i = 0; i < buttonOrder.length; i++) {
+                if (_pressedButtons.contains(buttonOrder[i])) {
+                  buttonMask |= (1 << i);
+                }
+              }
+
+              final ByteData packet = ByteData(20);
+              packet.setUint8(0, 0x01);
+              packet.setUint16(1, buttonMask, Endian.little);
+              packet.setInt8(3, (leftOut.dx * 127).round().clamp(-127, 127));
+              packet.setInt8(4, (leftOut.dy * 127).round().clamp(-127, 127));
+              packet.setInt8(5, (rightOut.dx * 127).round().clamp(-127, 127));
+              packet.setInt8(6, (rightOut.dy * 127).round().clamp(-127, 127));
+
+              if (_isGyroEnabled && _isNativeGyroHidMode) {
+                packet.setInt16(7, (_rawGyroX * 1000 * _gyroSensitivity).round().clamp(-32768, 32767), Endian.little);
+                packet.setInt16(9, (_rawGyroY * 1000 * _gyroSensitivity).round().clamp(-32768, 32767), Endian.little);
+                packet.setInt16(11, (_rawGyroZ * 1000 * _gyroSensitivity).round().clamp(-32768, 32767), Endian.little);
+              }
+
+              try {
+                await _btChannel.invokeMethod('sendHidReport', packet.buffer.asUint8List());
+              } catch (_) {}
+            }
+
+            Future<void> _initBluetoothHid() async {
+              try {
+                final String? result = await _btChannel.invokeMethod<String>('startHidProfile', {'profile': _selectedControllerProfile});
+                if (result != null) setState(() => _btStatus = result);
+              } on PlatformException catch (e) {
+                setState(() => _btStatus = '蓝牙提示: ${e.message}');
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final Size screenSize = MediaQuery.of(context).size;
+              final Offset rightPreview = _finalRightOutput;
+
+              return Scaffold(
+                body: Stack(
+                  children: [
+                    if (_isRightStickSwipeMode && !_isEditLayoutMode)
+                      Positioned(
+                        left: screenSize.width * 0.45,
+                        top: 56,
+                        right: 0,
+                        bottom: 0,
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onPanUpdate: _onRightTouchpadPanUpdate,
+                          onPanEnd: (_) => setState(() => _swipeDeltaOutput = Offset.zero),
+                          child: Container(
+                            decoration: const BoxDecoration(
+                              border: Border(left: BorderSide(color: Color(0x2600E5FF), width: 1)),
+                            ),
+                            alignment: Alignment.bottomRight,
+                            padding: const EdgeInsets.all(16),
+                            child: Text(
+                              '3D 自由滑屏视角区 (输出: ${rightPreview.dx.toStringAsFixed(2)}, ${rightPreview.dy.toStringAsFixed(2)})',
+                              style: const TextStyle(color: Color(0x7300E5FF), fontSize: 12),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ..._layoutConfigs.map((cfg) => _buildPositionedControl(cfg, screenSize)),
+                    Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
+                    if (_isEditLayoutMode && _selectedWidgetId != null)
+                      Positioned(
+                        bottom: 16,
+                        left: screenSize.width * 0.25,
+                        right: screenSize.width * 0.25,
+                        child: _buildScaleEditorBar(),
+                      ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _buildTopToolbar() {
+              return Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xA6000000),
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.bluetooth_connected, color: Colors.cyanAccent, size: 20),
+                          onPressed: _initBluetoothHid,
+                        ),
+                        Text(_btStatus, style: const TextStyle(fontSize: 11, color: Colors.white70)),
+                      ],
+                    ),
+                    Row(
+                      children: [
+                        DropdownButton<String>(
+                          value: _selectedControllerProfile,
+                          dropdownColor: const Color(0xFF1B1F27),
+                          style: const TextStyle(fontSize: 11, color: Colors.cyanAccent),
+                          items: const [
+                            DropdownMenuItem(value: 'XBOX', child: Text('模拟: Xbox')),
+                            DropdownMenuItem(value: 'PS5', child: Text('模拟: PS5')),
+                            DropdownMenuItem(value: 'SWITCH', child: Text('模拟: Switch')),
+                          ],
+                          onChanged: (val) {
+                            if (val != null) setState(() => _selectedControllerProfile = val);
+                          },
+                        ),
+                        const SizedBox(width: 8),
+                        FilterChip(
+                          label: Text(_isRightStickSwipeMode ? '3D滑屏' : '传统回中', style: const TextStyle(fontSize: 10)),
+                          selected: _isRightStickSwipeMode,
+                          onSelected: (v) => setState(() => _isRightStickSwipeMode = v),
+                        ),
+                        const SizedBox(width: 6),
+                        FilterChip(
+                          label: Text('体感', style: const TextStyle(fontSize: 10)),
+                          selected: _isGyroEnabled,
+                          onSelected: (v) => setState(() => _isGyroEnabled = v),
+                        ),
+                        const SizedBox(width: 6),
+                        ElevatedButton.icon(
+                          icon: Icon(_isEditLayoutMode ? Icons.save : Icons.open_with, size: 14),
+                          label: Text(_isEditLayoutMode ? '保存' : '自定义', style: const TextStyle(fontSize: 11)),
+                          onPressed: () {
+                            setState(() => _isEditLayoutMode = !_isEditLayoutMode);
+                            if (!_isEditLayoutMode) _saveLayout();
+                          },
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.tune, size: 18),
+                          onPressed: _showSensitivitySettingsSheet,
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _buildPositionedControl(PadWidgetConfig cfg, Size screenSize) {
+              final double baseSize = (cfg.id == 'LEFT_STICK' || cfg.id == 'RIGHT_STICK') ? 135.0 : 58.0;
+              final double finalSize = baseSize * cfg.scale;
+              final double left = (cfg.xRatio * screenSize.width) - finalSize / 2;
+              final double top = (cfg.yRatio * screenSize.height) - finalSize / 2;
+
+              Widget controlChild;
+              if (cfg.id == 'LEFT_STICK') {
+                controlChild = _buildAnalogStick(
+                  size: finalSize,
+                  label: 'L',
+                  currentNormalized: _leftStickPos,
+                  onStickChanged: (val) => setState(() => _leftStickPos = val),
+                );
+              } else if (cfg.id == 'RIGHT_STICK') {
+                controlChild = _isRightStickSwipeMode
+                    ? _buildSwipeTouchpadZone(finalSize)
+                    : _buildAnalogStick(
+                        size: finalSize,
+                        label: 'R',
+                        currentNormalized: _rightStickPos,
+                        onStickChanged: (val) => setState(() => _rightStickPos = val),
+                      );
+              } else {
+                controlChild = _buildActionButton(cfg.id, cfg.label, finalSize);
+              }
+
+              return Positioned(
+                left: left.clamp(0.0, screenSize.width - finalSize),
+                top: top.clamp(0.0, screenSize.height - finalSize),
+                child: _isEditLayoutMode
+                    ? GestureDetector(
+                        onTap: () => setState(() => _selectedWidgetId = cfg.id),
+                        onPanUpdate: (details) {
+                          setState(() {
+                            _selectedWidgetId = cfg.id;
+                            cfg.xRatio = ((cfg.xRatio * screenSize.width + details.delta.dx) / screenSize.width).clamp(0.04, 0.96);
+                            cfg.yRatio = ((cfg.yRatio * screenSize.height + details.delta.dy) / screenSize.height).clamp(0.08, 0.94);
+                          });
+                        },
+                        child: Container(
+                          decoration: BoxDecoration(
+                            border: Border.all(
+                              color: _selectedWidgetId == cfg.id ? Colors.amberAccent : Colors.redAccent,
+                              width: 2,
+                            ),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: controlChild,
+                        ),
+                      )
+                    : controlChild,
+              );
+            }
+
+            Widget _buildAnalogStick({
+              required double size,
+              required String label,
+              required Offset currentNormalized,
+              required ValueChanged<Offset> onStickChanged,
+            }) {
+              final double radius = size / 2;
+              final double knobRadius = size * 0.22;
+
+              return GestureDetector(
+                onPanUpdate: _isEditLayoutMode
+                    ? null
+                    : (details) {
+                        final Offset center = Offset(radius, radius);
+                        final Offset delta = details.localPosition - center;
+                        final double dist = delta.distance;
+                        final double maxDist = radius - knobRadius;
+                        final Offset clamped = dist > maxDist ? (delta / dist) * maxDist : delta;
+                        onStickChanged(Offset(clamped.dx / maxDist, clamped.dy / maxDist));
+                      },
+                onPanEnd: _isEditLayoutMode ? null : (_) => onStickChanged(Offset.zero),
+                child: Container(
+                  width: size,
+                  height: size,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0x14FFFFFF),
+                    border: Border.all(color: const Color(0x6600E5FF), width: 2),
+                  ),
+                  child: Center(
+                    child: Transform.translate(
+                      offset: Offset(
+                        currentNormalized.dx * (radius - knobRadius),
+                        currentNormalized.dy * (radius - knobRadius),
+                      ),
+                      child: Container(
+                        width: knobRadius * 2,
+                        height: knobRadius * 2,
+                        decoration: const BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Color(0xBF00E5FF),
+                          boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
+                        ),
+                        alignment: Alignment.center,
+                        child: Text(label, style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            Widget _buildSwipeTouchpadZone(double size) {
+              return GestureDetector(
+                onPanUpdate: _onRightTouchpadPanUpdate,
+                onPanEnd: (_) => setState(() => _swipeDeltaOutput = Offset.zero),
+                child: Container(
+                  width: size * 1.25,
+                  height: size,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(20),
+                    color: const Color(0x1400E5FF),
+                    border: Border.all(color: const Color(0x8000E5FF), width: 1.5),
+                  ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.touch_app, color: Colors.cyanAccent, size: 24),
+                      const SizedBox(height: 2),
+                      const Text('3D 滑屏视角区', style: TextStyle(fontSize: 10, color: Colors.cyanAccent)),
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            Widget _buildActionButton(String id, String label, double size) {
+              final bool isPressed = _pressedButtons.contains(id);
+              return Listener(
+                onPointerDown: _isEditLayoutMode ? null : (_) => setState(() => _pressedButtons.add(id)),
+                onPointerUp: _isEditLayoutMode ? null : (_) => setState(() => _pressedButtons.remove(id)),
+                onPointerCancel: _isEditLayoutMode ? null : (_) => setState(() => _pressedButtons.remove(id)),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 30),
+                  width: size,
+                  height: size,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: isPressed ? Colors.cyanAccent : const Color(0x1FFFFFFF),
+                    border: Border.all(color: isPressed ? Colors.white : Colors.white38, width: 2),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      color: isPressed ? Colors.black : Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: size * 0.32,
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            Widget _buildScaleEditorBar() {
+              final cfg = _layoutConfigs.firstWhere((e) => e.id == _selectedWidgetId);
+              return Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: Colors.amberAccent),
+                ),
+                child: Row(
+                  children: [
+                    Text('当前选中: ${cfg.label}', style: const TextStyle(color: Colors.amberAccent, fontSize: 13)),
+                    Expanded(
+                      child: Slider(
+                        value: cfg.scale,
+                        min: 0.6,
+                        max: 1.8,
+                        onChanged: (val) => setState(() => cfg.scale = val),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () {
+                        setState(() => _initDefaultLayout());
+                        _saveLayout();
+                      },
+                      child: const Text('重置全部', style: TextStyle(color: Colors.redAccent)),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            void _showSensitivitySettingsSheet() {
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                backgroundColor: const Color(0xFF1B1F27),
+                builder: (ctx) {
+                  return StatefulBuilder(
+                    builder: (context, setModalState) {
+                      return Padding(
+                        padding: const EdgeInsets.all(20),
+                        child: SingleChildScrollView(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text('灵敏度与死区微调', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
+                              const Divider(color: Colors.white24),
+                              _buildSliderRow('左摇杆灵敏度', _leftStickSensitivity, 0.2, 2.5, (v) {
+                                setModalState(() => _leftStickSensitivity = v);
+                                setState(() {});
+                              }),
+                              _buildSliderRow('右摇杆灵敏度', _rightStickSensitivity, 0.2, 2.5, (v) {
+                                setModalState(() => _rightStickSensitivity = v);
+                                setState(() {});
+                              }),
+                              _buildSliderRow('3D手游滑屏视角灵敏度', _swipeViewSensitivity, 0.4, 3.5, (v) {
+                                setModalState(() => _swipeViewSensitivity = v);
+                                setState(() {});
+                              }),
+                              _buildSliderRow('陀螺仪体感灵敏度', _gyroSensitivity, 0.1, 3.0, (v) {
+                                setModalState(() => _gyroSensitivity = v);
+                                setState(() {});
+                              }),
+                              _buildSliderRow('摇杆中心死区', _stickDeadzone, 0.0, 0.30, (v) {
+                                setModalState(() => _stickDeadzone = v);
+                                setState(() {});
+                              }),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                },
+              );
+            }
+
+            Widget _buildSliderRow(String title, double value, double min, double max, ValueChanged<double> onChanged) {
+              return Row(
+                children: [
+                  SizedBox(width: 210, child: Text('$title (${value.toStringAsFixed(2)})', style: const TextStyle(fontSize: 13))),
+                  Expanded(
+                    child: Slider(value: value, min: min, max: max, onChanged: onChanged),
+                  ),
+                ],
+              );
+            }
+          }
+          EOF
+
+          cat << 'EOF' > android/app/src/main/java/com/example/virtual_gamepad/MainActivity.java
+          package com.example.virtual_gamepad;
+
+          import android.annotation.SuppressLint;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothHidDevice;
+          import android.bluetooth.BluetoothHidDeviceAppSdpSettings;
+          import android.bluetooth.BluetoothManager;
+          import android.bluetooth.BluetoothProfile;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.hardware.Sensor;
+          import android.hardware.SensorEvent;
+          import android.hardware.SensorEventListener;
+          import android.hardware.SensorManager;
+          import android.os.Build;
+          import io.flutter.embedding.android.FlutterActivity;
+          import io.flutter.embedding.engine.FlutterEngine;
+          import io.flutter.plugin.common.MethodChannel;
+          import java.util.Arrays;
+          import java.util.concurrent.Executors;
+
+          @SuppressLint({"MissingPermission", "NewApi"})
+          public class MainActivity extends FlutterActivity implements SensorEventListener {
+              private static final String CHANNEL = "com.gamepad.hid/bluetooth";
+              private BluetoothHidDevice hidDevice;
+              private BluetoothDevice hostDevice;
+              private double gyroX = 0.0;
+              private double gyroY = 0.0;
+              private double gyroZ = 0.0;
+
+              private static final byte[] DESC_XBOX = new byte[]{
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x05, (byte) 0xA1, (byte) 0x01,
+                  (byte) 0x85, (byte) 0x01, (byte) 0x05, (byte) 0x09, (byte) 0x19, (byte) 0x01,
+                  (byte) 0x29, (byte) 0x10, (byte) 0x15, (byte) 0x00, (byte) 0x25, (byte) 0x01,
+                  (byte) 0x75, (byte) 0x01, (byte) 0x95, (byte) 0x10, (byte) 0x81, (byte) 0x02,
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x30, (byte) 0x09, (byte) 0x31,
+                  (byte) 0x09, (byte) 0x32, (byte) 0x09, (byte) 0x35, (byte) 0x15, (byte) 0x81,
+                  (byte) 0x25, (byte) 0x7F, (byte) 0x75, (byte) 0x08, (byte) 0x95, (byte) 0x04,
+                  (byte) 0x81, (byte) 0x02, (byte) 0xC0
+              };
+
+              private static final byte[] DESC_PS5 = new byte[]{
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x05, (byte) 0xA1, (byte) 0x01,
+                  (byte) 0x85, (byte) 0x01, (byte) 0x05, (byte) 0x09, (byte) 0x19, (byte) 0x01,
+                  (byte) 0x29, (byte) 0x0E, (byte) 0x15, (byte) 0x00, (byte) 0x25, (byte) 0x01,
+                  (byte) 0x75, (byte) 0x01, (byte) 0x95, (byte) 0x0E, (byte) 0x81, (byte) 0x02,
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x30, (byte) 0x09, (byte) 0x31,
+                  (byte) 0x09, (byte) 0x33, (byte) 0x09, (byte) 0x34, (byte) 0x15, (byte) 0x81,
+                  (byte) 0x25, (byte) 0x7F, (byte) 0x75, (byte) 0x08, (byte) 0x95, (byte) 0x04,
+                  (byte) 0x81, (byte) 0x02, (byte) 0xC0
+              };
+
+              private static final byte[] DESC_SWITCH = new byte[]{
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x05, (byte) 0xA1, (byte) 0x01,
+                  (byte) 0x85, (byte) 0x01, (byte) 0x05, (byte) 0x09, (byte) 0x19, (byte) 0x01,
+                  (byte) 0x29, (byte) 0x10, (byte) 0x15, (byte) 0x00, (byte) 0x25, (byte) 0x01,
+                  (byte) 0x75, (byte) 0x01, (byte) 0x95, (byte) 0x10, (byte) 0x81, (byte) 0x02,
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x30, (byte) 0x09, (byte) 0x31,
+                  (byte) 0x09, (byte) 0x32, (byte) 0x09, (byte) 0x35, (byte) 0x15, (byte) 0x81,
+                  (byte) 0x25, (byte) 0x7F, (byte) 0x75, (byte) 0x08, (byte) 0x95, (byte) 0x04,
+                  (byte) 0x81, (byte) 0x02, (byte) 0xC0
+              };
+
+              @Override
+              public void configureFlutterEngine(FlutterEngine flutterEngine) {
+                  super.configureFlutterEngine(flutterEngine);
+                  SensorManager sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+                  if (sensorManager != null) {
+                      Sensor gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+                      if (gyroSensor != null) {
+                          sensorManager.registerListener(this, gyroSensor, SensorManager.SENSOR_DELAY_FASTEST);
+                      }
+                  }
+                  SharedPreferences prefs = getSharedPreferences("gamepad_prefs", Context.MODE_PRIVATE);
+
+                  new MethodChannel(flutterEngine.getDartExecutor().getBinaryMessenger(), CHANNEL)
+                      .setMethodCallHandler((call, result) -> {
+                          switch (call.method) {
+                              case "getGyro":
+                                  result.success(Arrays.asList(gyroX, gyroY, gyroZ));
+                                  break;
+                              case "saveLayout":
+                                  if (call.arguments instanceof String) {
+                                      prefs.edit().putString("custom_gamepad_layout_v1", (String) call.arguments).apply();
+                                  }
+                                  result.success(true);
+                                  break;
+                              case "loadLayout":
+                                  result.success(prefs.getString("custom_gamepad_layout_v1", null));
+                                  break;
+                              case "startHidProfile":
+                                  String profile = call.argument("profile");
+                                  initBluetoothHid(result, profile != null ? profile : "XBOX");
+                                  break;
+                              case "sendHidReport":
+                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && call.arguments instanceof byte[]) {
+                                      byte[] bytes = (byte[]) call.arguments;
+                                      if (bytes.length >= 7 && hidDevice != null && hostDevice != null) {
+                                          int reportId = bytes[0];
+                                          byte[] payload = Arrays.copyOfRange(bytes, 1, 7);
+                                          try {
+                                              hidDevice.sendReport(hostDevice, reportId, payload);
+                                          } catch (Exception ignored) {}
+                                      }
+                                  }
+                                  result.success(null);
+                                  break;
+                              default:
+                                  result.notImplemented();
+                                  break;
+                          }
+                      });
+              }
+
+              @Override
+              public void onSensorChanged(SensorEvent event) {
+                  if (event != null && event.sensor != null && event.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
+                      gyroX = event.values[0];
+                      gyroY = event.values[1];
+                      gyroZ = event.values[2];
+                  }
+              }
+
+              @Override
+              public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+
+              private void initBluetoothHid(MethodChannel.Result result, String profileName) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                      result.success("需要 Android 9.0+");
+                      return;
+                  }
+                  BluetoothManager btManager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+                  BluetoothAdapter adapter = btManager != null ? btManager.getAdapter() : null;
+                  if (adapter == null || !adapter.isEnabled()) {
+                      result.success("请先开启手机蓝牙");
+                      return;
+                  }
+
+                  byte[] targetDesc = DESC_XBOX;
+                  String devName = "Xbox Wireless Controller";
+                  if ("PS5".equals(profileName)) {
+                      targetDesc = DESC_PS5;
+                      devName = "Wireless Controller";
+                  } else if ("SWITCH".equals(profileName)) {
+                      targetDesc = DESC_SWITCH;
+                      devName = "Pro Controller";
+                  }
+
+                  try {
+                      adapter.getProfileProxy(this, new BluetoothProfile.ServiceListener() {
+                          @Override
+                          public void onServiceConnected(int profile, BluetoothProfile proxy) {
+                              if (profile == BluetoothProfile.HID_DEVICE && proxy instanceof BluetoothHidDevice) {
+                                  hidDevice = (BluetoothHidDevice) proxy;
+                                  BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
+                                      devName, "Virtual Gamepad", "FlutterHID",
+                                      BluetoothHidDevice.SUBCLASS1_COMBO, targetDesc
+                                  );
+                                  try {
+                                      hidDevice.unregisterApp(sdp);
+                                  } catch (Exception ignored) {}
+                                  try {
+                                      hidDevice.registerApp(sdp, null, null, Executors.newSingleThreadExecutor(),
+                                          new BluetoothHidDevice.Callback() {
+                                              @Override
+                                              public void onConnectionStateChanged(BluetoothDevice device, int state) {
+                                                  if (state == BluetoothProfile.STATE_CONNECTED) {
+                                                      hostDevice = device;
+                                                  }
+                                              }
+                                          });
+                                  } catch (Exception ignored) {}
+                              }
+                          }
+                          @Override
+                          public void onServiceDisconnected(int profile) {
+                              hidDevice = null;
+                          }
+                      }, BluetoothProfile.HID_DEVICE);
+                      result.success("已切换: " + profileName);
+                  } catch (Exception e) {
+                      result.success("错误: " + e.getMessage());
+                  }
+              }
+          }
+          EOF
+
+          # 自动向 build.gradle 注入 AGP 8+ 必需的 namespace
+          python3 -c '
+          gradle_path = "android/app/build.gradle"
+          content = open(gradle_path).read()
+          if "namespace" not in content:
+              content = content.replace("android {", "android {\n    namespace \"com.example.virtual_gamepad\"", 1)
+              open(gradle_path, "w").write(content)
+          '
+
+          python3 -c '
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p).read()
+          perms = """<uses-permission android:name="android.permission.BLUETOOTH" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <application"""
+          open(p, "w").write(s.replace("<application", perms, 1))
+          '
+
+          flutter build apk --release
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-APK-Installer
+          path: app_build/build/app/outputs/flutter-apk/app-release.apk
+
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+      - name: Build IPA
+        run: |
+          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
+          cd app_build
+          flutter build ios --release --no-codesign
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r VirtualGamepad-iOS.ipa Payload
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-IPA-Installer
+          path: app_build/VirtualGamepad-iOS.ipaname: Auto Build APK and IPA
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+      - name: Build APK
+        run: |
+          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
+          cd app_build
+
+          cat << 'EOF' > lib/main.dart
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:math' as math;
+          import 'dart:typed_data';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+
+          void main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await SystemChrome.setPreferredOrientations([
+              DeviceOrientation.landscapeLeft,
+              DeviceOrientation.landscapeRight,
+            ]);
+            await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+            runApp(const VirtualGamepadApp());
+          }
+
+          class VirtualGamepadApp extends StatelessWidget {
+            const VirtualGamepadApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'Pro Virtual Gamepad',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData.dark().copyWith(
+                  scaffoldBackgroundColor: const Color(0xFF121418),
+                  colorScheme: const ColorScheme.dark(primary: Color(0xFF00E5FF)),
+                ),
+                home: const GamepadScreen(),
+              );
+            }
+          }
+
+          class PadWidgetConfig {
+            final String id;
+            final String label;
+            double xRatio;
+            double yRatio;
+            double scale;
+
+            PadWidgetConfig({required this.id, required this.label, required this.xRatio, required this.yRatio, this.scale = 1.0});
+
+            Map<String, dynamic> toJson() => {'id': id, 'label': label, 'xRatio': xRatio, 'yRatio': yRatio, 'scale': scale};
+
+            factory PadWidgetConfig.fromJson(Map<String, dynamic> json) => PadWidgetConfig(
+                  id: json['id'],
+                  label: json['label'],
+                  xRatio: (json['xRatio'] as num).toDouble(),
+                  yRatio: (json['yRatio'] as num).toDouble(),
+                  scale: (json['scale'] as num).toDouble(),
+                );
+          }
+
+          class GamepadScreen extends StatefulWidget {
+            const GamepadScreen({super.key});
+
+            @override
+            State<GamepadScreen> createState() => _GamepadScreenState();
+          }
+
+          class _GamepadScreenState extends State<GamepadScreen> {
+            static const MethodChannel _btChannel = MethodChannel('com.gamepad.hid/bluetooth');
+
+            bool _isEditLayoutMode = false;
+            bool _isRightStickSwipeMode = true;
+            bool _isGyroEnabled = true;
+            bool _isNativeGyroHidMode = true;
+            String _selectedControllerProfile = 'XBOX';
+            String _btStatus = '蓝牙就绪 (点击连接)';
+            String? _selectedWidgetId;
+
+            double _leftStickSensitivity = 1.0;
+            double _rightStickSensitivity = 1.2;
+            double _swipeViewSensitivity = 1.8;
+            double _gyroSensitivity = 1.5;
+            double _stickDeadzone = 0.08;
+
+            final Set<String> _pressedButtons = {};
+            Offset _leftStickPos = Offset.zero;
+            Offset _rightStickPos = Offset.zero;
+            Offset _swipeDeltaOutput = Offset.zero;
+            Offset _gyroOffset = Offset.zero;
+            double _rawGyroX = 0.0, _rawGyroY = 0.0, _rawGyroZ = 0.0;
+
+            Timer? _hidReportTimer;
+            Timer? _swipeDecayTimer;
+            late List<PadWidgetConfig> _layoutConfigs;
+
+            @override
+            void initState() {
+              super.initState();
+              _initDefaultLayout();
+              _loadSavedLayout();
+              _hidReportTimer = Timer.periodic(const Duration(milliseconds: 6), (_) {
+                _pollNativeGyroAndSendReport();
+              });
+            }
+
+            @override
+            void dispose() {
+              _hidReportTimer?.cancel();
+              _swipeDecayTimer?.cancel();
+              super.dispose();
+            }
+
+            void _initDefaultLayout() {
+              _layoutConfigs = [
+                PadWidgetConfig(id: 'LEFT_STICK', label: '左摇杆', xRatio: 0.16, yRatio: 0.65, scale: 1.1),
+                PadWidgetConfig(id: 'RIGHT_STICK', label: '右视角区', xRatio: 0.78, yRatio: 0.65, scale: 1.15),
+                PadWidgetConfig(id: 'BTN_A', label: 'A', xRatio: 0.88, yRatio: 0.45, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_B', label: 'B', xRatio: 0.94, yRatio: 0.32, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_X', label: 'X', xRatio: 0.82, yRatio: 0.32, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_Y', label: 'Y', xRatio: 0.88, yRatio: 0.20, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_L1', label: 'L1', xRatio: 0.12, yRatio: 0.15, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_L2', label: 'L2', xRatio: 0.24, yRatio: 0.15, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_R1', label: 'R1', xRatio: 0.88, yRatio: 0.10, scale: 1.0),
+                PadWidgetConfig(id: 'BTN_R2', label: 'R2', xRatio: 0.76, yRatio: 0.10, scale: 1.0),
+                PadWidgetConfig(id: 'DPAD_UP', label: '↑', xRatio: 0.32, yRatio: 0.45, scale: 0.9),
+                PadWidgetConfig(id: 'DPAD_DOWN', label: '↓', xRatio: 0.32, yRatio: 0.72, scale: 0.9),
+                PadWidgetConfig(id: 'DPAD_LEFT', label: '←', xRatio: 0.26, yRatio: 0.58, scale: 0.9),
+                PadWidgetConfig(id: 'DPAD_RIGHT', label: '→', xRatio: 0.38, yRatio: 0.58, scale: 0.9),
+              ];
+            }
+
+            Future<void> _loadSavedLayout() async {
+              try {
+                final String? savedJson = await _btChannel.invokeMethod<String>('loadLayout');
+                if (savedJson != null && savedJson.isNotEmpty) {
+                  final List decoded = jsonDecode(savedJson);
+                  setState(() {
+                    _layoutConfigs = decoded.map((e) => PadWidgetConfig.fromJson(e)).toList();
+                  });
+                }
+              } catch (_) {}
+            }
+
+            Future<void> _saveLayout() async {
+              try {
+                final encoded = jsonEncode(_layoutConfigs.map((e) => e.toJson()).toList());
+                await _btChannel.invokeMethod('saveLayout', encoded);
+              } catch (_) {}
+            }
+
+            Offset _applySensitivityCurve(Offset rawInput, double sensitivity) {
+              double mag = rawInput.distance;
+              if (mag <= _stickDeadzone) return Offset.zero;
+              double normalizedMag = ((mag - _stickDeadzone) / (1.0 - _stickDeadzone)).clamp(0.0, 1.0);
+              double curvedMag = (math.pow(normalizedMag, 1.2) * sensitivity).clamp(0.0, 1.0);
+              double angle = math.atan2(rawInput.dy, rawInput.dx);
+              return Offset(math.cos(angle) * curvedMag, math.sin(angle) * curvedMag);
+            }
+
+            void _onRightTouchpadPanUpdate(DragUpdateDetails details) {
+              if (_isEditLayoutMode) return;
+              const double basePixelScale = 16.0;
+              double dx = (details.delta.dx / basePixelScale) * _swipeViewSensitivity;
+              double dy = (details.delta.dy / basePixelScale) * _swipeViewSensitivity;
+              setState(() {
+                _swipeDeltaOutput = Offset(dx.clamp(-1.0, 1.0), dy.clamp(-1.0, 1.0));
+              });
+              _swipeDecayTimer?.cancel();
+              _swipeDecayTimer = Timer(const Duration(milliseconds: 18), () {
+                if (mounted) setState(() => _swipeDeltaOutput = Offset.zero);
+              });
+            }
+
+            Offset get _finalRightOutput {
+              Offset baseRight = _isRightStickSwipeMode
+                  ? _swipeDeltaOutput
+                  : _applySensitivityCurve(_rightStickPos, _rightStickSensitivity);
+              if (!_isGyroEnabled) return baseRight;
+              return Offset(
+                (baseRight.dx + _gyroOffset.dx).clamp(-1.0, 1.0),
+                (baseRight.dy + _gyroOffset.dy).clamp(-1.0, 1.0),
+              );
+            }
+
+            Future<void> _pollNativeGyroAndSendReport() async {
+              if (_isEditLayoutMode) return;
+
+              if (_isGyroEnabled) {
+                try {
+                  final List<dynamic>? gyro = await _btChannel.invokeMethod<List<dynamic>>('getGyro');
+                  if (gyro != null && gyro.length >= 3) {
+                    _rawGyroX = (gyro[0] as num).toDouble();
+                    _rawGyroY = (gyro[1] as num).toDouble();
+                    _rawGyroZ = (gyro[2] as num).toDouble();
+                    const double gyroDeadzone = 0.02;
+                    double yawRate = -_rawGyroZ;
+                    double pitchRate = -_rawGyroY;
+                    if (yawRate.abs() < gyroDeadzone) yawRate = 0.0;
+                    if (pitchRate.abs() < gyroDeadzone) pitchRate = 0.0;
+                    if (mounted) {
+                      setState(() {
+                        _gyroOffset = Offset(
+                          (yawRate * 0.25 * _gyroSensitivity).clamp(-1.0, 1.0),
+                          (pitchRate * 0.25 * _gyroSensitivity).clamp(-1.0, 1.0),
+                        );
+                      });
+                    }
+                  }
+                } catch (_) {}
+              } else {
+                _gyroOffset = Offset.zero;
+              }
+
+              final Offset leftOut = _applySensitivityCurve(_leftStickPos, _leftStickSensitivity);
+              final Offset rightOut = _finalRightOutput;
+
+              int buttonMask = 0;
+              const buttonOrder = [
+                'BTN_A', 'BTN_B', 'BTN_X', 'BTN_Y',
+                'BTN_L1', 'BTN_R1', 'BTN_L2', 'BTN_R2',
+                'DPAD_UP', 'DPAD_DOWN', 'DPAD_LEFT', 'DPAD_RIGHT'
+              ];
+              for (int i = 0; i < buttonOrder.length; i++) {
+                if (_pressedButtons.contains(buttonOrder[i])) {
+                  buttonMask |= (1 << i);
+                }
+              }
+
+              final ByteData packet = ByteData(20);
+              packet.setUint8(0, 0x01);
+              packet.setUint16(1, buttonMask, Endian.little);
+              packet.setInt8(3, (leftOut.dx * 127).round().clamp(-127, 127));
+              packet.setInt8(4, (leftOut.dy * 127).round().clamp(-127, 127));
+              packet.setInt8(5, (rightOut.dx * 127).round().clamp(-127, 127));
+              packet.setInt8(6, (rightOut.dy * 127).round().clamp(-127, 127));
+
+              if (_isGyroEnabled && _isNativeGyroHidMode) {
+                packet.setInt16(7, (_rawGyroX * 1000 * _gyroSensitivity).round().clamp(-32768, 32767), Endian.little);
+                packet.setInt16(9, (_rawGyroY * 1000 * _gyroSensitivity).round().clamp(-32768, 32767), Endian.little);
+                packet.setInt16(11, (_rawGyroZ * 1000 * _gyroSensitivity).round().clamp(-32768, 32767), Endian.little);
+              }
+
+              try {
+                await _btChannel.invokeMethod('sendHidReport', packet.buffer.asUint8List());
+              } catch (_) {}
+            }
+
+            Future<void> _initBluetoothHid() async {
+              try {
+                final String? result = await _btChannel.invokeMethod<String>('startHidProfile', {'profile': _selectedControllerProfile});
+                if (result != null) setState(() => _btStatus = result);
+              } on PlatformException catch (e) {
+                setState(() => _btStatus = '蓝牙提示: ${e.message}');
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final Size screenSize = MediaQuery.of(context).size;
+              final Offset rightPreview = _finalRightOutput;
+
+              return Scaffold(
+                body: Stack(
+                  children: [
+                    if (_isRightStickSwipeMode && !_isEditLayoutMode)
+                      Positioned(
+                        left: screenSize.width * 0.45,
+                        top: 56,
+                        right: 0,
+                        bottom: 0,
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onPanUpdate: _onRightTouchpadPanUpdate,
+                          onPanEnd: (_) => setState(() => _swipeDeltaOutput = Offset.zero),
+                          child: Container(
+                            decoration: const BoxDecoration(
+                              border: Border(left: BorderSide(color: Color(0x2600E5FF), width: 1)),
+                            ),
+                            alignment: Alignment.bottomRight,
+                            padding: const EdgeInsets.all(16),
+                            child: Text(
+                              '3D 自由滑屏视角区 (输出: ${rightPreview.dx.toStringAsFixed(2)}, ${rightPreview.dy.toStringAsFixed(2)})',
+                              style: const TextStyle(color: Color(0x7300E5FF), fontSize: 12),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ..._layoutConfigs.map((cfg) => _buildPositionedControl(cfg, screenSize)),
+                    Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
+                    if (_isEditLayoutMode && _selectedWidgetId != null)
+                      Positioned(
+                        bottom: 16,
+                        left: screenSize.width * 0.25,
+                        right: screenSize.width * 0.25,
+                        child: _buildScaleEditorBar(),
+                      ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _buildTopToolbar() {
+              return Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xA6000000),
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.bluetooth_connected, color: Colors.cyanAccent, size: 20),
+                          onPressed: _initBluetoothHid,
+                        ),
+                        Text(_btStatus, style: const TextStyle(fontSize: 11, color: Colors.white70)),
+                      ],
+                    ),
+                    Row(
+                      children: [
+                        DropdownButton<String>(
+                          value: _selectedControllerProfile,
+                          dropdownColor: const Color(0xFF1B1F27),
+                          style: const TextStyle(fontSize: 11, color: Colors.cyanAccent),
+                          items: const [
+                            DropdownMenuItem(value: 'XBOX', child: Text('模拟: Xbox')),
+                            DropdownMenuItem(value: 'PS5', child: Text('模拟: PS5')),
+                            DropdownMenuItem(value: 'SWITCH', child: Text('模拟: Switch')),
+                          ],
+                          onChanged: (val) {
+                            if (val != null) setState(() => _selectedControllerProfile = val);
+                          },
+                        ),
+                        const SizedBox(width: 8),
+                        FilterChip(
+                          label: Text(_isRightStickSwipeMode ? '3D滑屏' : '传统回中', style: const TextStyle(fontSize: 10)),
+                          selected: _isRightStickSwipeMode,
+                          onSelected: (v) => setState(() => _isRightStickSwipeMode = v),
+                        ),
+                        const SizedBox(width: 6),
+                        FilterChip(
+                          label: Text('体感', style: const TextStyle(fontSize: 10)),
+                          selected: _isGyroEnabled,
+                          onSelected: (v) => setState(() => _isGyroEnabled = v),
+                        ),
+                        const SizedBox(width: 6),
+                        ElevatedButton.icon(
+                          icon: Icon(_isEditLayoutMode ? Icons.save : Icons.open_with, size: 14),
+                          label: Text(_isEditLayoutMode ? '保存' : '自定义', style: const TextStyle(fontSize: 11)),
+                          onPressed: () {
+                            setState(() => _isEditLayoutMode = !_isEditLayoutMode);
+                            if (!_isEditLayoutMode) _saveLayout();
+                          },
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.tune, size: 18),
+                          onPressed: _showSensitivitySettingsSheet,
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _buildPositionedControl(PadWidgetConfig cfg, Size screenSize) {
+              final double baseSize = (cfg.id == 'LEFT_STICK' || cfg.id == 'RIGHT_STICK') ? 135.0 : 58.0;
+              final double finalSize = baseSize * cfg.scale;
+              final double left = (cfg.xRatio * screenSize.width) - finalSize / 2;
+              final double top = (cfg.yRatio * screenSize.height) - finalSize / 2;
+
+              Widget controlChild;
+              if (cfg.id == 'LEFT_STICK') {
+                controlChild = _buildAnalogStick(
+                  size: finalSize,
+                  label: 'L',
+                  currentNormalized: _leftStickPos,
+                  onStickChanged: (val) => setState(() => _leftStickPos = val),
+                );
+              } else if (cfg.id == 'RIGHT_STICK') {
+                controlChild = _isRightStickSwipeMode
+                    ? _buildSwipeTouchpadZone(finalSize)
+                    : _buildAnalogStick(
+                        size: finalSize,
+                        label: 'R',
+                        currentNormalized: _rightStickPos,
+                        onStickChanged: (val) => setState(() => _rightStickPos = val),
+                      );
+              } else {
+                controlChild = _buildActionButton(cfg.id, cfg.label, finalSize);
+              }
+
+              return Positioned(
+                left: left.clamp(0.0, screenSize.width - finalSize),
+                top: top.clamp(0.0, screenSize.height - finalSize),
+                child: _isEditLayoutMode
+                    ? GestureDetector(
+                        onTap: () => setState(() => _selectedWidgetId = cfg.id),
+                        onPanUpdate: (details) {
+                          setState(() {
+                            _selectedWidgetId = cfg.id;
+                            cfg.xRatio = ((cfg.xRatio * screenSize.width + details.delta.dx) / screenSize.width).clamp(0.04, 0.96);
+                            cfg.yRatio = ((cfg.yRatio * screenSize.height + details.delta.dy) / screenSize.height).clamp(0.08, 0.94);
+                          });
+                        },
+                        child: Container(
+                          decoration: BoxDecoration(
+                            border: Border.all(
+                              color: _selectedWidgetId == cfg.id ? Colors.amberAccent : Colors.redAccent,
+                              width: 2,
+                            ),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: controlChild,
+                        ),
+                      )
+                    : controlChild,
+              );
+            }
+
+            Widget _buildAnalogStick({
+              required double size,
+              required String label,
+              required Offset currentNormalized,
+              required ValueChanged<Offset> onStickChanged,
+            }) {
+              final double radius = size / 2;
+              final double knobRadius = size * 0.22;
+
+              return GestureDetector(
+                onPanUpdate: _isEditLayoutMode
+                    ? null
+                    : (details) {
+                        final Offset center = Offset(radius, radius);
+                        final Offset delta = details.localPosition - center;
+                        final double dist = delta.distance;
+                        final double maxDist = radius - knobRadius;
+                        final Offset clamped = dist > maxDist ? (delta / dist) * maxDist : delta;
+                        onStickChanged(Offset(clamped.dx / maxDist, clamped.dy / maxDist));
+                      },
+                onPanEnd: _isEditLayoutMode ? null : (_) => onStickChanged(Offset.zero),
+                child: Container(
+                  width: size,
+                  height: size,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0x14FFFFFF),
+                    border: Border.all(color: const Color(0x6600E5FF), width: 2),
+                  ),
+                  child: Center(
+                    child: Transform.translate(
+                      offset: Offset(
+                        currentNormalized.dx * (radius - knobRadius),
+                        currentNormalized.dy * (radius - knobRadius),
+                      ),
+                      child: Container(
+                        width: knobRadius * 2,
+                        height: knobRadius * 2,
+                        decoration: const BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Color(0xBF00E5FF),
+                          boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
+                        ),
+                        alignment: Alignment.center,
+                        child: Text(label, style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            Widget _buildSwipeTouchpadZone(double size) {
+              return GestureDetector(
+                onPanUpdate: _onRightTouchpadPanUpdate,
+                onPanEnd: (_) => setState(() => _swipeDeltaOutput = Offset.zero),
+                child: Container(
+                  width: size * 1.25,
+                  height: size,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(20),
+                    color: const Color(0x1400E5FF),
+                    border: Border.all(color: const Color(0x8000E5FF), width: 1.5),
+                  ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.touch_app, color: Colors.cyanAccent, size: 24),
+                      const SizedBox(height: 2),
+                      const Text('3D 滑屏视角区', style: TextStyle(fontSize: 10, color: Colors.cyanAccent)),
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            Widget _buildActionButton(String id, String label, double size) {
+              final bool isPressed = _pressedButtons.contains(id);
+              return Listener(
+                onPointerDown: _isEditLayoutMode ? null : (_) => setState(() => _pressedButtons.add(id)),
+                onPointerUp: _isEditLayoutMode ? null : (_) => setState(() => _pressedButtons.remove(id)),
+                onPointerCancel: _isEditLayoutMode ? null : (_) => setState(() => _pressedButtons.remove(id)),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 30),
+                  width: size,
+                  height: size,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: isPressed ? Colors.cyanAccent : const Color(0x1FFFFFFF),
+                    border: Border.all(color: isPressed ? Colors.white : Colors.white38, width: 2),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      color: isPressed ? Colors.black : Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: size * 0.32,
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            Widget _buildScaleEditorBar() {
+              final cfg = _layoutConfigs.firstWhere((e) => e.id == _selectedWidgetId);
+              return Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: Colors.amberAccent),
+                ),
+                child: Row(
+                  children: [
+                    Text('当前选中: ${cfg.label}', style: const TextStyle(color: Colors.amberAccent, fontSize: 13)),
+                    Expanded(
+                      child: Slider(
+                        value: cfg.scale,
+                        min: 0.6,
+                        max: 1.8,
+                        onChanged: (val) => setState(() => cfg.scale = val),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () {
+                        setState(() => _initDefaultLayout());
+                        _saveLayout();
+                      },
+                      child: const Text('重置全部', style: TextStyle(color: Colors.redAccent)),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            void _showSensitivitySettingsSheet() {
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                backgroundColor: const Color(0xFF1B1F27),
+                builder: (ctx) {
+                  return StatefulBuilder(
+                    builder: (context, setModalState) {
+                      return Padding(
+                        padding: const EdgeInsets.all(20),
+                        child: SingleChildScrollView(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text('灵敏度与死区微调', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
+                              const Divider(color: Colors.white24),
+                              _buildSliderRow('左摇杆灵敏度', _leftStickSensitivity, 0.2, 2.5, (v) {
+                                setModalState(() => _leftStickSensitivity = v);
+                                setState(() {});
+                              }),
+                              _buildSliderRow('右摇杆灵敏度', _rightStickSensitivity, 0.2, 2.5, (v) {
+                                setModalState(() => _rightStickSensitivity = v);
+                                setState(() {});
+                              }),
+                              _buildSliderRow('3D手游滑屏视角灵敏度', _swipeViewSensitivity, 0.4, 3.5, (v) {
+                                setModalState(() => _swipeViewSensitivity = v);
+                                setState(() {});
+                              }),
+                              _buildSliderRow('陀螺仪体感灵敏度', _gyroSensitivity, 0.1, 3.0, (v) {
+                                setModalState(() => _gyroSensitivity = v);
+                                setState(() {});
+                              }),
+                              _buildSliderRow('摇杆中心死区', _stickDeadzone, 0.0, 0.30, (v) {
+                                setModalState(() => _stickDeadzone = v);
+                                setState(() {});
+                              }),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                },
+              );
+            }
+
+            Widget _buildSliderRow(String title, double value, double min, double max, ValueChanged<double> onChanged) {
+              return Row(
+                children: [
+                  SizedBox(width: 210, child: Text('$title (${value.toStringAsFixed(2)})', style: const TextStyle(fontSize: 13))),
+                  Expanded(
+                    child: Slider(value: value, min: min, max: max, onChanged: onChanged),
+                  ),
+                ],
+              );
+            }
+          }
+          EOF
+
+          cat << 'EOF' > android/app/src/main/java/com/example/virtual_gamepad/MainActivity.java
+          package com.example.virtual_gamepad;
+
+          import android.annotation.SuppressLint;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothHidDevice;
+          import android.bluetooth.BluetoothHidDeviceAppSdpSettings;
+          import android.bluetooth.BluetoothManager;
+          import android.bluetooth.BluetoothProfile;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.hardware.Sensor;
+          import android.hardware.SensorEvent;
+          import android.hardware.SensorEventListener;
+          import android.hardware.SensorManager;
+          import android.os.Build;
+          import io.flutter.embedding.android.FlutterActivity;
+          import io.flutter.embedding.engine.FlutterEngine;
+          import io.flutter.plugin.common.MethodChannel;
+          import java.util.Arrays;
+          import java.util.concurrent.Executors;
+
+          @SuppressLint({"MissingPermission", "NewApi"})
+          public class MainActivity extends FlutterActivity implements SensorEventListener {
+              private static final String CHANNEL = "com.gamepad.hid/bluetooth";
+              private BluetoothHidDevice hidDevice;
+              private BluetoothDevice hostDevice;
+              private double gyroX = 0.0;
+              private double gyroY = 0.0;
+              private double gyroZ = 0.0;
+
+              private static final byte[] DESC_XBOX = new byte[]{
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x05, (byte) 0xA1, (byte) 0x01,
+                  (byte) 0x85, (byte) 0x01, (byte) 0x05, (byte) 0x09, (byte) 0x19, (byte) 0x01,
+                  (byte) 0x29, (byte) 0x10, (byte) 0x15, (byte) 0x00, (byte) 0x25, (byte) 0x01,
+                  (byte) 0x75, (byte) 0x01, (byte) 0x95, (byte) 0x10, (byte) 0x81, (byte) 0x02,
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x30, (byte) 0x09, (byte) 0x31,
+                  (byte) 0x09, (byte) 0x32, (byte) 0x09, (byte) 0x35, (byte) 0x15, (byte) 0x81,
+                  (byte) 0x25, (byte) 0x7F, (byte) 0x75, (byte) 0x08, (byte) 0x95, (byte) 0x04,
+                  (byte) 0x81, (byte) 0x02, (byte) 0xC0
+              };
+
+              private static final byte[] DESC_PS5 = new byte[]{
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x05, (byte) 0xA1, (byte) 0x01,
+                  (byte) 0x85, (byte) 0x01, (byte) 0x05, (byte) 0x09, (byte) 0x19, (byte) 0x01,
+                  (byte) 0x29, (byte) 0x0E, (byte) 0x15, (byte) 0x00, (byte) 0x25, (byte) 0x01,
+                  (byte) 0x75, (byte) 0x01, (byte) 0x95, (byte) 0x0E, (byte) 0x81, (byte) 0x02,
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x30, (byte) 0x09, (byte) 0x31,
+                  (byte) 0x09, (byte) 0x33, (byte) 0x09, (byte) 0x34, (byte) 0x15, (byte) 0x81,
+                  (byte) 0x25, (byte) 0x7F, (byte) 0x75, (byte) 0x08, (byte) 0x95, (byte) 0x04,
+                  (byte) 0x81, (byte) 0x02, (byte) 0xC0
+              };
+
+              private static final byte[] DESC_SWITCH = new byte[]{
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x05, (byte) 0xA1, (byte) 0x01,
+                  (byte) 0x85, (byte) 0x01, (byte) 0x05, (byte) 0x09, (byte) 0x19, (byte) 0x01,
+                  (byte) 0x29, (byte) 0x10, (byte) 0x15, (byte) 0x00, (byte) 0x25, (byte) 0x01,
+                  (byte) 0x75, (byte) 0x01, (byte) 0x95, (byte) 0x10, (byte) 0x81, (byte) 0x02,
+                  (byte) 0x05, (byte) 0x01, (byte) 0x09, (byte) 0x30, (byte) 0x09, (byte) 0x31,
+                  (byte) 0x09, (byte) 0x32, (byte) 0x09, (byte) 0x35, (byte) 0x15, (byte) 0x81,
+                  (byte) 0x25, (byte) 0x7F, (byte) 0x75, (byte) 0x08, (byte) 0x95, (byte) 0x04,
+                  (byte) 0x81, (byte) 0x02, (byte) 0xC0
+              };
+
+              @Override
+              public void configureFlutterEngine(FlutterEngine flutterEngine) {
+                  super.configureFlutterEngine(flutterEngine);
+                  SensorManager sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+                  if (sensorManager != null) {
+                      Sensor gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+                      if (gyroSensor != null) {
+                          sensorManager.registerListener(this, gyroSensor, SensorManager.SENSOR_DELAY_FASTEST);
+                      }
+                  }
+                  SharedPreferences prefs = getSharedPreferences("gamepad_prefs", Context.MODE_PRIVATE);
+
+                  new MethodChannel(flutterEngine.getDartExecutor().getBinaryMessenger(), CHANNEL)
+                      .setMethodCallHandler((call, result) -> {
+                          switch (call.method) {
+                              case "getGyro":
+                                  result.success(Arrays.asList(gyroX, gyroY, gyroZ));
+                                  break;
+                              case "saveLayout":
+                                  if (call.arguments instanceof String) {
+                                      prefs.edit().putString("custom_gamepad_layout_v1", (String) call.arguments).apply();
+                                  }
+                                  result.success(true);
+                                  break;
+                              case "loadLayout":
+                                  result.success(prefs.getString("custom_gamepad_layout_v1", null));
+                                  break;
+                              case "startHidProfile":
+                                  String profile = call.argument("profile");
+                                  initBluetoothHid(result, profile != null ? profile : "XBOX");
+                                  break;
+                              case "sendHidReport":
+                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && call.arguments instanceof byte[]) {
+                                      byte[] bytes = (byte[]) call.arguments;
+                                      if (bytes.length >= 7 && hidDevice != null && hostDevice != null) {
+                                          int reportId = bytes[0];
+                                          byte[] payload = Arrays.copyOfRange(bytes, 1, 7);
+                                          try {
+                                              hidDevice.sendReport(hostDevice, reportId, payload);
+                                          } catch (Exception ignored) {}
+                                      }
+                                  }
+                                  result.success(null);
+                                  break;
+                              default:
+                                  result.notImplemented();
+                                  break;
+                          }
+                      });
+              }
+
+              @Override
+              public void onSensorChanged(SensorEvent event) {
+                  if (event != null && event.sensor != null && event.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
+                      gyroX = event.values[0];
+                      gyroY = event.values[1];
+                      gyroZ = event.values[2];
+                  }
+              }
+
+              @Override
+              public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+
+              private void initBluetoothHid(MethodChannel.Result result, String profileName) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                      result.success("需要 Android 9.0+");
+                      return;
+                  }
+                  BluetoothManager btManager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+                  BluetoothAdapter adapter = btManager != null ? btManager.getAdapter() : null;
+                  if (adapter == null || !adapter.isEnabled()) {
+                      result.success("请先开启手机蓝牙");
+                      return;
+                  }
+
+                  byte[] targetDesc = DESC_XBOX;
+                  String devName = "Xbox Wireless Controller";
+                  if ("PS5".equals(profileName)) {
+                      targetDesc = DESC_PS5;
+                      devName = "Wireless Controller";
+                  } else if ("SWITCH".equals(profileName)) {
+                      targetDesc = DESC_SWITCH;
+                      devName = "Pro Controller";
+                  }
+
+                  try {
+                      adapter.getProfileProxy(this, new BluetoothProfile.ServiceListener() {
+                          @Override
+                          public void onServiceConnected(int profile, BluetoothProfile proxy) {
+                              if (profile == BluetoothProfile.HID_DEVICE && proxy instanceof BluetoothHidDevice) {
+                                  hidDevice = (BluetoothHidDevice) proxy;
+                                  BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
+                                      devName, "Virtual Gamepad", "FlutterHID",
+                                      BluetoothHidDevice.SUBCLASS1_COMBO, targetDesc
+                                  );
+                                  try {
+                                      hidDevice.unregisterApp(sdp);
+                                  } catch (Exception ignored) {}
+                                  try {
+                                      hidDevice.registerApp(sdp, null, null, Executors.newSingleThreadExecutor(),
+                                          new BluetoothHidDevice.Callback() {
+                                              @Override
+                                              public void onConnectionStateChanged(BluetoothDevice device, int state) {
+                                                  if (state == BluetoothProfile.STATE_CONNECTED) {
+                                                      hostDevice = device;
+                                                  }
+                                              }
+                                          });
+                                  } catch (Exception ignored) {}
+                              }
+                          }
+                          @Override
+                          public void onServiceDisconnected(int profile) {
+                              hidDevice = null;
+                          }
+                      }, BluetoothProfile.HID_DEVICE);
+                      result.success("已切换: " + profileName);
+                  } catch (Exception e) {
+                      result.success("错误: " + e.getMessage());
+                  }
+              }
+          }
+          EOF
+
+          # 自动向 build.gradle 注入 AGP 8+ 必需的 namespace
+          python3 -c '
+          gradle_path = "android/app/build.gradle"
+          content = open(gradle_path).read()
+          if "namespace" not in content:
+              content = content.replace("android {", "android {\n    namespace \"com.example.virtual_gamepad\"", 1)
+              open(gradle_path, "w").write(content)
+          '
 
           python3 -c '
           p = "android/app/src/main/AndroidManifest.xml"
