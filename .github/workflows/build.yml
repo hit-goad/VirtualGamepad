@@ -137,6 +137,7 @@ jobs:
             static const MethodChannel _ch = MethodChannel('com.gamepad.hid/bluetooth');
 
             bool _isEditLayoutMode = false;
+            bool _isToolbarCollapsed = false;
             bool _isRightStickSwipeMode = true;
             bool _isGyroEnabled = false;
             bool _gyroHoldL2 = false;
@@ -166,11 +167,13 @@ jobs:
             bool _sendQueued = false;
 
             Timer? _sendTimer;
+            Timer? _inputTicker;
             Timer? _uiTimer;
             late List<PadWidgetConfig> _layoutConfigs;
 
             @override
             void initState() {
+              _startInputTicker();
               super.initState();
               _layoutConfigs = defaultLayout();
               _loadSavedLayout();
@@ -181,6 +184,7 @@ jobs:
 
             @override
             void dispose() {
+              _inputTicker?.cancel();
               _sendTimer?.cancel();
               _uiTimer?.cancel();
               super.dispose();
@@ -253,6 +257,15 @@ jobs:
               _sendTimer = Timer(const Duration(milliseconds: 2), () {
                 _sendQueued = false;
                 _pump();
+              });
+            }
+
+            void _startInputTicker() {
+              _inputTicker?.cancel();
+              // 陀螺仪和滑屏视角需要在“没有按键变化”时也持续发送。
+              // 4ms 仅作为触发器，_requestSend 会合并重复任务，避免堆积。
+              _inputTicker = Timer.periodic(const Duration(milliseconds: 4), (_) {
+                if (!_isEditLayoutMode) _requestSend();
               });
             }
 
@@ -402,7 +415,28 @@ jobs:
                         ),
                       ),
                     ..._layoutConfigs.map((c) => _buildPositionedControl(c, screenSize)),
-                    Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
+                    if (!_isToolbarCollapsed)
+                      Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
+                    if (_isToolbarCollapsed)
+                      Positioned(
+                        top: 10,
+                        right: 12,
+                        child: Material(
+                          color: Colors.transparent,
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: const Color(0xCC000000),
+                              shape: BoxShape.circle,
+                              border: Border.all(color: Colors.white24),
+                            ),
+                            child: IconButton(
+                              tooltip: '展开设置',
+                              icon: const Icon(Icons.tune, color: Colors.cyanAccent, size: 20),
+                              onPressed: () => setState(() => _isToolbarCollapsed = false),
+                            ),
+                          ),
+                        ),
+                      ),
                     if (_isEditLayoutMode && _selectedWidgetId != null)
                       Positioned(
                         bottom: 16,
@@ -419,6 +453,7 @@ jobs:
               if (_isEditLayoutMode) return;
               _swipeAccX += d.delta.dx;
               _swipeAccY += d.delta.dy;
+              _requestSend();
             }
 
             Widget _buildTopToolbar() {
@@ -467,6 +502,11 @@ jobs:
                                 setState(() => _isEditLayoutMode = !_isEditLayoutMode);
                                 if (!_isEditLayoutMode) _saveLayout();
                               },
+                            ),
+                            IconButton(
+                              tooltip: '收起设置栏',
+                              icon: const Icon(Icons.keyboard_arrow_up, size: 20),
+                              onPressed: () => setState(() => _isToolbarCollapsed = true),
                             ),
                             IconButton(icon: const Icon(Icons.tune, size: 20), onPressed: _showSettingsSheet),
                           ],
@@ -1489,6 +1529,7 @@ jobs:
             static const MethodChannel _ch = MethodChannel('com.gamepad.hid/bluetooth');
 
             bool _isEditLayoutMode = false;
+            bool _isToolbarCollapsed = false;
             bool _isRightStickSwipeMode = true;
             bool _isGyroEnabled = false;
             bool _gyroHoldL2 = false;
@@ -1737,7 +1778,28 @@ jobs:
                         ),
                       ),
                     ..._layoutConfigs.map((c) => _buildPositionedControl(c, screenSize)),
-                    Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
+                    if (!_isToolbarCollapsed)
+                      Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
+                    if (_isToolbarCollapsed)
+                      Positioned(
+                        top: 10,
+                        right: 12,
+                        child: Material(
+                          color: Colors.transparent,
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: const Color(0xCC000000),
+                              shape: BoxShape.circle,
+                              border: Border.all(color: Colors.white24),
+                            ),
+                            child: IconButton(
+                              tooltip: '展开设置',
+                              icon: const Icon(Icons.tune, color: Colors.cyanAccent, size: 20),
+                              onPressed: () => setState(() => _isToolbarCollapsed = false),
+                            ),
+                          ),
+                        ),
+                      ),
                     if (_isEditLayoutMode && _selectedWidgetId != null)
                       Positioned(
                         bottom: 16,
@@ -1802,6 +1864,11 @@ jobs:
                                 setState(() => _isEditLayoutMode = !_isEditLayoutMode);
                                 if (!_isEditLayoutMode) _saveLayout();
                               },
+                            ),
+                            IconButton(
+                              tooltip: '收起设置栏',
+                              icon: const Icon(Icons.keyboard_arrow_up, size: 20),
+                              onPressed: () => setState(() => _isToolbarCollapsed = true),
                             ),
                             IconButton(icon: const Icon(Icons.tune, size: 20), onPressed: _showSettingsSheet),
                           ],
