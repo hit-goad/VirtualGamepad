@@ -1048,8 +1048,18 @@ jobs:
                       if (hidDevice != null) {                       // 已有代理:换描述符需要重新注册
                           try { hidDevice.unregisterApp(); } catch (Throwable ignored) {}
                           hostDevice = null;
-                          boolean ok = registerApp();
-                          result.success(ok ? "已切换协议,请在主机上重新配对" : "重新注册失败");
+                          // unregisterApp 后系统可能需要几十毫秒释放 SDP；立即 registerApp 会偶发失败。
+                          final String p = profile;
+                          result.success("正在切换协议，请稍候并在电脑蓝牙中重新配对");
+                          new android.os.Handler(getMainLooper()).postDelayed(() -> {
+                              try {
+                                  if (hidDevice != null) {
+                                      if (!registerApp()) status = "重新注册 HID 失败，请再点一次启动";
+                                  }
+                              } catch (Throwable t) {
+                                  status = "重新注册 HID 出错: " + t.getMessage();
+                              }
+                          }, 250);
                           return;
                       }
                       boolean ok = adapter.getProfileProxy(this, new BluetoothProfile.ServiceListener() {
@@ -1079,13 +1089,15 @@ jobs:
                   String name;
                   String description;
                   if ("dinput".equals(profile)) {
-                      desc = DESC_DINPUT; name = "Virtual Gamepad"; description = "Virtual DirectInput Gamepad";
+                      // 保持旧版本完全一致，避免 Windows 已配对设备因 SDP 变化无法重连。
+                      desc = DESC_DINPUT; name = "Virtual Gamepad"; description = "Virtual Gamepad";
                   } else if ("ps5".equals(profile)) {
                       desc = DESC_PS5; name = "Wireless Controller"; description = "DualSense Compatible Controller";
                   } else if ("switch".equals(profile)) {
                       desc = DESC_SWITCH; name = "Pro Controller"; description = "Switch Pro Compatible Controller";
                   } else {
-                      desc = DESC_XBOX; name = "Xbox Wireless Controller"; description = "Xbox Compatible Controller";
+                      // Xbox 默认档严格沿用旧版本 SDP。
+                      desc = DESC_XBOX; name = "Xbox Wireless Controller"; description = "Virtual Gamepad";
                   }
                   BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
                       name, description, "VPad", BluetoothHidDevice.SUBCLASS2_GAMEPAD, desc);
