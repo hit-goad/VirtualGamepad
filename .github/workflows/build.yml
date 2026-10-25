@@ -577,38 +577,40 @@ jobs:
               final double knob = size * 0.22;
               final double maxDist = math.max(1.0, radius - knob);
 
-              // 严格按 X/Y 两个独立轴计算。不要把触摸位置转换成“对角线”方向，
-              // 也不要依赖当前摇杆位置；手指落点始终以摇杆中心为原点。
               void update(Offset local) {
-                final Offset center = Offset(radius, radius);
-                final Offset delta = local - center;
-                final double dist = delta.distance;
+                // X/Y 必须分别计算，不能把两个轴耦合在一起。
+                // 同时采用径向限幅，保证圆周边缘仍能得到完整的 ±1 范围。
+                final Offset delta = local - Offset(radius, radius);
 
-                Offset normalized;
-                if (dist <= maxDist) {
-                  normalized = Offset(delta.dx / maxDist, delta.dy / maxDist);
-                } else if (dist > 0) {
-                  // 圆形限幅：X/Y 仍然保持独立比例，因此四个正交方向和四个斜向
-                  // 都能完整输出。
-                  normalized = Offset(delta.dx / dist, delta.dy / dist);
-                } else {
-                  normalized = Offset.zero;
+                // X/Y 两个轴独立计算，避免部分触控/HID 解析路径把两个轴耦合成
+                // “左上/右下”两条对角线；最后只做圆形限幅。
+                double x = (delta.dx / maxDist).clamp(-1.0, 1.0).toDouble();
+                double y = (delta.dy / maxDist).clamp(-1.0, 1.0).toDouble();
+
+                const double dead = 0.055;
+                double remap(double v) {
+                  final double a = v.abs();
+                  if (a <= dead) return 0.0;
+                  final double m = ((a - dead) / (1.0 - dead)).clamp(0.0, 1.0).toDouble();
+                  return v.isNegative ? -m : m;
                 }
+                x = remap(x);
+                y = remap(y);
 
-                final double x = normalized.dx.clamp(-1.0, 1.0).toDouble();
-                final double y = normalized.dy.clamp(-1.0, 1.0).toDouble();
+                final double mag = math.sqrt(x * x + y * y);
+                if (mag > 1.0) {
+                  x /= mag;
+                  y /= mag;
+                }
                 onChanged(Offset(x, y));
               }
 
-              void reset() => onChanged(Offset.zero);
-
               return GestureDetector(
                 behavior: HitTestBehavior.opaque,
-                onPanDown: (d) => update(d.localPosition),
                 onPanStart: (d) => update(d.localPosition),
                 onPanUpdate: (d) => update(d.localPosition),
-                onPanEnd: (_) => reset(),
-                onPanCancel: reset,
+                onPanEnd: (_) { onChanged(Offset.zero); _requestSend(); },
+                onPanCancel: () { onChanged(Offset.zero); _requestSend(); },
                 child: Container(
                   width: size,
                   height: size,
@@ -619,7 +621,7 @@ jobs:
                   ),
                   child: Center(
                     child: Transform.translate(
-                      offset: Offset(value.dx * maxDist, value.dy * maxDist),
+                      offset: Offset(value.dx * (radius - knob), value.dy * (radius - knob)),
                       child: Container(
                         width: knob * 2,
                         height: knob * 2,
@@ -912,15 +914,21 @@ jobs:
                   0xC0
               );
 
-              /** 通用 DirectInput 手柄(Report ID 1,负载 9 字节)。 */
+              /** 通用 DirectInput 手柄(Report ID 1, 13 字节)。
+               * 四个摇杆轴改为独立 16-bit 有符号轴，兼容 Android 11+ / Windows 常见 HID 解析器。
+               */
               private static final byte[] DESC_DINPUT = b(
                   0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
-                  0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
-                  0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
+                  0x05, 0x09, 0x19, 0x01, 0x29, 0x10,
+                  0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+                  0x05, 0x01, 0x09, 0x39,
+                  0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
                   0x75, 0x04, 0x95, 0x01, 0x81, 0x03,
-                  0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
-                  0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
-                  0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+                  0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x33, 0x09, 0x34,
+                  0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F,
+                  0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
+                  0x05, 0x02, 0x09, 0xC5, 0x15, 0x00, 0x26, 0xFF, 0x00,
+                  0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
                   0xC0
               );
 
@@ -1245,6 +1253,15 @@ jobs:
                   return Math.max(0, Math.min(65535, a));
               }
 
+              private static int signedAxis16(byte v) {
+                  return Math.max(-32768, Math.min(32767, Math.round(v / 127f * 32767f)));
+              }
+
+              private static void putS16(byte[] r, int off, int v) {
+                  r[off] = (byte)(v & 0xFF);
+                  r[off + 1] = (byte)((v >> 8) & 0xFF);
+              }
+
               private static void put16(byte[] r, int off, int v) {
                   r[off] = (byte) (v & 0xFF);
                   r[off + 1] = (byte) ((v >> 8) & 0xFF);
@@ -1265,11 +1282,17 @@ jobs:
                   if ((mask & HOME) != 0) btn |= 1 << 10;
                   if ((mask & L2) != 0) btn |= 1 << 11;
                   if ((mask & R2) != 0) btn |= 1 << 12;
-                  byte[] r = new byte[9];
-                  r[0] = (byte)(btn & 0xFF); r[1] = (byte)((btn >> 8) & 0xFF);
+
+                  byte[] r = new byte[13];
+                  r[0] = (byte)(btn & 0xFF);
+                  r[1] = (byte)((btn >> 8) & 0xFF);
                   r[2] = (byte)hat(mask);
-                  r[3] = s[4]; r[4] = s[5]; r[5] = s[6]; r[6] = s[7];
-                  r[7] = s[8]; r[8] = s[9];
+                  putS16(r, 3, signedAxis16(s[4]));
+                  putS16(r, 5, signedAxis16(s[5]));
+                  putS16(r, 7, signedAxis16(s[6]));
+                  putS16(r, 9, signedAxis16(s[7]));
+                  r[11] = s[8];
+                  r[12] = s[9];
                   return r;
               }
 
@@ -1414,6 +1437,17 @@ jobs:
           print("manifest patched")
           EOF
           python3 patch_manifest.py
+
+          # Android 11+ (API 30) 基线；Android 12+ 仍使用 BLUETOOTH_CONNECT/ADVERTISE。
+          cat << 'EOF' > patch_android_sdk.py
+          import re
+          p = "android/app/build.gradle"
+          s = open(p, encoding="utf-8").read()
+          s = re.sub(r'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 30', s)
+          s = re.sub(r'targetSdkVersion\s+flutter\.targetSdkVersion', 'targetSdkVersion 35', s)
+          open(p, "w", encoding="utf-8").write(s)
+          EOF
+          python3 patch_android_sdk.py
 
           flutter build apk --release
       - name: Upload Android APK
@@ -1960,38 +1994,40 @@ jobs:
               final double knob = size * 0.22;
               final double maxDist = math.max(1.0, radius - knob);
 
-              // 严格按 X/Y 两个独立轴计算。不要把触摸位置转换成“对角线”方向，
-              // 也不要依赖当前摇杆位置；手指落点始终以摇杆中心为原点。
               void update(Offset local) {
-                final Offset center = Offset(radius, radius);
-                final Offset delta = local - center;
-                final double dist = delta.distance;
+                // X/Y 必须分别计算，不能把两个轴耦合在一起。
+                // 同时采用径向限幅，保证圆周边缘仍能得到完整的 ±1 范围。
+                final Offset delta = local - Offset(radius, radius);
 
-                Offset normalized;
-                if (dist <= maxDist) {
-                  normalized = Offset(delta.dx / maxDist, delta.dy / maxDist);
-                } else if (dist > 0) {
-                  // 圆形限幅：X/Y 仍然保持独立比例，因此四个正交方向和四个斜向
-                  // 都能完整输出。
-                  normalized = Offset(delta.dx / dist, delta.dy / dist);
-                } else {
-                  normalized = Offset.zero;
+                // X/Y 两个轴独立计算，避免部分触控/HID 解析路径把两个轴耦合成
+                // “左上/右下”两条对角线；最后只做圆形限幅。
+                double x = (delta.dx / maxDist).clamp(-1.0, 1.0).toDouble();
+                double y = (delta.dy / maxDist).clamp(-1.0, 1.0).toDouble();
+
+                const double dead = 0.055;
+                double remap(double v) {
+                  final double a = v.abs();
+                  if (a <= dead) return 0.0;
+                  final double m = ((a - dead) / (1.0 - dead)).clamp(0.0, 1.0).toDouble();
+                  return v.isNegative ? -m : m;
                 }
+                x = remap(x);
+                y = remap(y);
 
-                final double x = normalized.dx.clamp(-1.0, 1.0).toDouble();
-                final double y = normalized.dy.clamp(-1.0, 1.0).toDouble();
+                final double mag = math.sqrt(x * x + y * y);
+                if (mag > 1.0) {
+                  x /= mag;
+                  y /= mag;
+                }
                 onChanged(Offset(x, y));
               }
 
-              void reset() => onChanged(Offset.zero);
-
               return GestureDetector(
                 behavior: HitTestBehavior.opaque,
-                onPanDown: (d) => update(d.localPosition),
                 onPanStart: (d) => update(d.localPosition),
                 onPanUpdate: (d) => update(d.localPosition),
-                onPanEnd: (_) => reset(),
-                onPanCancel: reset,
+                onPanEnd: (_) { onChanged(Offset.zero); _requestSend(); },
+                onPanCancel: () { onChanged(Offset.zero); _requestSend(); },
                 child: Container(
                   width: size,
                   height: size,
@@ -2002,7 +2038,7 @@ jobs:
                   ),
                   child: Center(
                     child: Transform.translate(
-                      offset: Offset(value.dx * maxDist, value.dy * maxDist),
+                      offset: Offset(value.dx * (radius - knob), value.dy * (radius - knob)),
                       child: Container(
                         width: knob * 2,
                         height: knob * 2,
