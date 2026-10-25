@@ -1440,12 +1440,25 @@ jobs:
 
           # Android 11+ (API 30) 基线；Android 12+ 仍使用 BLUETOOTH_CONNECT/ADVERTISE。
           cat << 'EOF' > patch_android_sdk.py
+          from pathlib import Path
           import re
-          p = "android/app/build.gradle"
-          s = open(p, encoding="utf-8").read()
-          s = re.sub(r'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 30', s)
-          s = re.sub(r'targetSdkVersion\s+flutter\.targetSdkVersion', 'targetSdkVersion 35', s)
-          open(p, "w", encoding="utf-8").write(s)
+
+          # Flutter stable 的新 Android 模板可能使用 build.gradle.kts，
+          # 老模板使用 build.gradle；两种都兼容。
+          candidates = [Path("android/app/build.gradle.kts"), Path("android/app/build.gradle")]
+          p = next((x for x in candidates if x.exists()), None)
+          if p is None:
+              raise SystemExit("ERROR: android/app/build.gradle(.kts) not found")
+
+          s = p.read_text(encoding="utf-8")
+          if p.suffix == ".kts":
+              s = re.sub(r'minSdk\s*=\s*flutter\.minSdkVersion', 'minSdk = 30', s)
+              s = re.sub(r'targetSdk\s*=\s*flutter\.targetSdkVersion', 'targetSdk = 35', s)
+          else:
+              s = re.sub(r'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 30', s)
+              s = re.sub(r'targetSdkVersion\s+flutter\.targetSdkVersion', 'targetSdkVersion 35', s)
+          p.write_text(s, encoding="utf-8")
+          print(f"Android SDK patched: {p}")
           EOF
           python3 patch_android_sdk.py
 
