@@ -1,12 +1,17 @@
-name: Auto Build APK and IPA
+name: Build Android APK (Bluetooth HID Gamepad)
 
 on:
   push:
   workflow_dispatch:
 
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-android:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -16,9 +21,10 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
+          cache: true
       - name: Generate Project and Build APK
         run: |
-          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
+          flutter create --org com.example --project-name virtual_gamepad --platforms=android -a java app_build
           cd app_build
 
           cat << 'EOF' > lib/main.dart
@@ -262,10 +268,12 @@ jobs:
 
             void _startInputTicker() {
               _inputTicker?.cancel();
-              // 陀螺仪和滑屏视角需要在“没有按键变化”时也持续发送。
-              // 4ms 仅作为触发器，_requestSend 会合并重复任务，避免堆积。
-              _inputTicker = Timer.periodic(const Duration(milliseconds: 4), (_) {
-                if (!_isEditLayoutMode) _requestSend();
+              // 只有"连续量"需要定时发送:陀螺仪体感和滑屏视角。纯按键/摇杆由触摸事件触发,
+              // 空闲时一次也不发。原来 4ms 无条件全量发送(约 250 次/秒)远超蓝牙 HID 的连接间隔
+              // (约 11ms),报告只能在链路里排队,表现就是越推越迟、松手后手柄还在动。
+              _inputTicker = Timer.periodic(const Duration(milliseconds: 8), (_) {
+                if (_isEditLayoutMode) return;
+                if (_isGyroEnabled || _isRightStickSwipeMode) _requestSend();
               });
             }
 
@@ -366,6 +374,15 @@ jobs:
                         onTap: () async {
                           Navigator.pop(ctx);
                           try { await _ch.invokeMethod('makeDiscoverable'); } catch (_) {}
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.bluetooth_disabled),
+                        title: const Text('打开系统蓝牙'),
+                        subtitle: const Text('连不上电脑时,先确认手机蓝牙已打开'),
+                        onTap: () async {
+                          Navigator.pop(ctx);
+                          try { await _ch.invokeMethod('enableBluetooth'); } catch (_) {}
                         },
                       ),
                       const Divider(color: Colors.white24),
@@ -592,16 +609,13 @@ jobs:
                 double x = normalized.dx.clamp(-1.0, 1.0).toDouble();
                 double y = normalized.dy.clamp(-1.0, 1.0).toDouble();
 
-                // 小死区 + 等比例重映射，避免中心漂移，同时不破坏四个轴向。
-                const double dead = 0.06;
+                // 圆形限幅:斜方向推到角落时把长度压回 1,保证 8 个方向都能到 ±1。
+                // 死区只由 _curve() 里的 _stickDeadzone 处理 —— 这里原本还有一个 0.06 的死区,
+                // 和默认 0.08 叠加后接近 14%,小幅推杆完全没有输出,看起来就像"摇杆只有几个角"。
                 final double mag = math.sqrt(x * x + y * y);
-                if (mag < dead) {
-                  x = 0;
-                  y = 0;
-                } else if (mag > 0) {
-                  final double m = ((mag - dead) / (1.0 - dead)).clamp(0.0, 1.0).toDouble();
-                  x = x / mag * m;
-                  y = y / mag * m;
+                if (mag > 1.0) {
+                  x = x / mag;
+                  y = y / mag;
                 }
                 onChanged(Offset(x, y));
               }
@@ -777,7 +791,8 @@ jobs:
                                 value: 'switch', groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
-                              const Text('切换协议后请停止当前 HID 服务并重新配对；部分主机会缓存 HID 描述符。',
+                              const Text('切换协议后请点蓝牙图标重启 HID,并在主机上删除旧配对再重新配对。'
+                                        '主机会缓存 HID 描述符:换过版本后若摇杆/按键错位,先"删除设备"再配对即可。',
                                   style: TextStyle(fontSize: 11, color: Colors.amberAccent)),
                               const SizedBox(height: 8),
                               const Text('屏幕按键样式(只改标签和位置含义,不改协议)', style: TextStyle(fontSize: 13)),
@@ -880,10 +895,12 @@ jobs:
               private final float[] gyro = new float[3];
               private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
-              // 只在状态变化时发送,并限制最高约 125 Hz:重复刷同样的报告只会堵塞蓝牙链路、拉高延迟
-              private final byte[] lastReport = new byte[16];
-              private volatile int lastLen = 0;
-              private long lastSendNs = 0;
+              // 只在状态变化时发送,并限制发送频率:重复刷同样的报告只会堵塞蓝牙链路、拉高延迟。
+              // lastReport 做成"整块替换"的不可变快照,因为 onGetReport 在 HID 回调线程里读它。
+              private volatile byte[] lastReport = new byte[0];
+              private volatile long lastSendNs = 0;
+              // 最近一次真正发出的输入报告,供主机 GET_REPORT 回读(Windows 配对后通常会先要一份)
+              private volatile byte[] currentReport = null;
 
               // ------------------------------------------------------------------
               // HID 描述符
@@ -1019,6 +1036,10 @@ jobs:
                                   makeDiscoverable();
                                   result.success(null);
                                   break;
+                              case "enableBluetooth":
+                                  enableBluetooth();
+                                  result.success(null);
+                                  break;
                               case "getBonded":
                                   result.success(bonded());
                                   break;
@@ -1115,18 +1136,16 @@ jobs:
                       if (hidDevice != null) {                       // 已有代理:换描述符需要重新注册
                           try { hidDevice.unregisterApp(); } catch (Throwable ignored) {}
                           hostDevice = null;
-                          // unregisterApp 后系统可能需要几十毫秒释放 SDP；立即 registerApp 会偶发失败。
-                          final String p = profile;
+                          currentReport = null;
                           result.success("正在切换协议，请稍候并在电脑蓝牙中重新配对");
+                          // unregisterApp 后系统需要几十毫秒释放 SDP；立即 registerApp 会偶发失败。
                           new android.os.Handler(getMainLooper()).postDelayed(() -> {
                               try {
-                                  if (hidDevice != null) {
-                                      if (!registerApp()) status = "重新注册 HID 失败，请再点一次启动";
-                                  }
+                                  if (hidDevice != null) startRegister();
                               } catch (Throwable t) {
                                   status = "重新注册 HID 出错: " + t.getMessage();
                               }
-                          }, 250);
+                          }, 400);
                           return;
                       }
                       boolean ok = adapter.getProfileProxy(this, new BluetoothProfile.ServiceListener() {
@@ -1135,7 +1154,7 @@ jobs:
                               if (p != BluetoothProfile.HID_DEVICE) return;
                               try {
                                   hidDevice = (BluetoothHidDevice) proxy;
-                                  if (!registerApp()) status = "注册 HID 失败(本机可能不支持)";
+                                  startRegister();
                               } catch (Throwable t) {
                                   status = "注册 HID 出错: " + t.getMessage();
                               }
@@ -1144,6 +1163,13 @@ jobs:
                           @Override
                           public void onServiceDisconnected(int p) { hidDevice = null; hostDevice = null; }
                       }, BluetoothProfile.HID_DEVICE);
+                      if (ok) {
+                          // 个别机型/被裁剪的系统没有 HID 设备角色:getProfileProxy 会一直不回调,
+                          // 用户只看到"正在启动…"却永远连不上,这里补一个超时提示。
+                          new android.os.Handler(getMainLooper()).postDelayed(() -> {
+                              if (hidDevice == null) status = "本机蓝牙栈没有提供 HID 设备角色(系统不支持或被裁剪)";
+                          }, 4000);
+                      }
                       result.success(ok ? "正在启动手柄… 请点“让手机可被发现”并在主机上配对"
                                         : "本机系统不支持“蓝牙 HID 设备”模式");
                   } catch (Throwable t) {
@@ -1151,7 +1177,21 @@ jobs:
                   }
               }
 
-              private boolean registerApp() {
+              /** 注册 HID 应用(换描述符后也走这里)。
+               *  上一次安装的版本可能把 HID 应用留在系统里,直接 registerApp 会一直返回 false,
+               *  所以失败时先 unregisterApp,等 SDP 释放后再试一次。 */
+              private void startRegister() {
+                  if (registerAppOnce()) { status = "手柄已就绪:请在主机蓝牙里配对本手机"; return; }
+                  try { if (hidDevice != null) hidDevice.unregisterApp(); } catch (Throwable ignored) {}
+                  status = "正在重置 HID 注册…";
+                  new android.os.Handler(getMainLooper()).postDelayed(() -> {
+                      status = registerAppOnce()
+                              ? "手柄已就绪:请在主机蓝牙里配对本手机"
+                              : "注册 HID 失败(本机可能不支持 HID 设备模式)";
+                  }, 500);
+              }
+
+              private boolean registerAppOnce() {
                   byte[] desc;
                   String name;
                   String description;
@@ -1174,9 +1214,13 @@ jobs:
                       BluetoothHidDeviceAppQosSettings qos = new BluetoothHidDeviceAppQosSettings(
                           BluetoothHidDeviceAppQosSettings.SERVICE_BEST_EFFORT, 800, 9, 0, 11250,
                           BluetoothHidDeviceAppQosSettings.MAX);
+                      // 参数顺序是 (sdp, inQos, outQos, executor, callback)
                       ok = hidDevice.registerApp(sdp, null, qos, executor, cb);
                   } catch (Throwable ignored) {}
-                  if (!ok) ok = hidDevice.registerApp(sdp, null, null, executor, cb);
+                  if (!ok) {
+                      try { ok = hidDevice.registerApp(sdp, null, null, executor, cb); } catch (Throwable ignored) {}
+                  }
+                  if (ok) { lastReport = new byte[0]; lastSendNs = 0; }
                   return ok;
               }
 
@@ -1185,20 +1229,95 @@ jobs:
                       @Override
                       public void onAppStatusChanged(BluetoothDevice plugged, boolean registered) {
                           status = registered ? "手柄已就绪:请在主机蓝牙里配对本手机" : "手柄服务已注销";
+                          if (registered) { lastReport = new byte[0]; lastSendNs = 0; }
                       }
 
                       @Override
                       public void onConnectionStateChanged(BluetoothDevice device, int state) {
                           if (state == BluetoothProfile.STATE_CONNECTED) {
                               hostDevice = device;
-                              lastLen = 0;
+                              lastReport = new byte[0];   // 新连接:第一份报告要立刻发出去
+                              lastSendNs = 0;
                               status = "已连接: " + nameOf(device);
+                              // 主动发一份"回中"报告:部分主机(尤其 Linux/模拟器)要等到第一份输入报告
+                              // 才真正建立输入设备节点,否则会显示"已连接但没反应"。
+                              try {
+                                  BluetoothHidDevice h = hidDevice;
+                                  byte[] init = idleReport(reportSize());
+                                  int rid = "switch".equals(profile) ? 0x30 : 1;
+                                  if (h != null && h.sendReport(device, rid, init)) {
+                                      lastReport = init;
+                                      currentReport = init;
+                                      lastSendNs = System.nanoTime();
+                                  }
+                              } catch (Throwable ignored) {}
                           } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
                               if (hostDevice != null && hostDevice.equals(device)) hostDevice = null;
-                              status = "已断开";
+                              status = "已断开 (在主机端重新连接即可)";
                           }
                       }
+
+                      /** Windows / Linux 连上 HID 设备后通常会先发一次 GET_REPORT 取当前输入报告。
+                       *  默认实现什么都不回,主机会认为设备无响应 —— 这正是"配对成功但手柄用不了"的常见原因。
+                       *  注意 Callback 里是 void,必须用 replyReport() 回。 */
+                      @Override
+                      public void onGetReport(BluetoothDevice device, byte type, byte id, int bufferSize) {
+                          BluetoothHidDevice h = hidDevice;
+                          if (h == null) return;
+                          try {
+                              if (type == BluetoothHidDevice.REPORT_TYPE_FEATURE) {
+                                  h.reportError(device, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ);
+                                  return;
+                              }
+                              byte[] cur = currentReport;
+                              byte[] data;
+                              if (cur == null || cur.length == 0) {
+                                  data = idleReport(bufferSize);
+                              } else if (bufferSize <= 0 || bufferSize == cur.length) {
+                                  data = Arrays.copyOf(cur, cur.length);
+                              } else {
+                                  data = Arrays.copyOf(cur, bufferSize);
+                              }
+                              h.replyReport(device, type, id, data);
+                          } catch (Throwable ignored) {}
+                      }
+
+                      /** 主机下发的输出报告(震动/LED 等):接受并忽略;拒绝会让部分主机判定握手失败。 */
+                      @Override
+                      public void onSetReport(BluetoothDevice device, byte type, byte id, byte[] data) {
+                          BluetoothHidDevice h = hidDevice;
+                          if (h == null) return;
+                          try { h.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS); } catch (Throwable ignored) {}
+                      }
+
+                      @Override
+                      public void onVirtualCableUnplug(BluetoothDevice device) {
+                          hostDevice = null;
+                          currentReport = null;
+                          status = "主机端已断开";
+                      }
                   };
+              }
+
+              /** 还没收到过输入报告时,给主机一份"全部回中"的报告。 */
+              private byte[] idleReport(int bufferSize) {
+                  int n = bufferSize > 0 ? bufferSize : reportSize();
+                  byte[] r = new byte[n];
+                  if ("xbox".equals(profile)) {
+                      if (n >= 8) { put16(r, 0, 32768); put16(r, 2, 32768); put16(r, 4, 32768); put16(r, 6, 32768); }
+                  } else if ("ps5".equals(profile)) {
+                      Arrays.fill(r, (byte) 128);
+                  } else if ("switch".equals(profile)) {
+                      if (n >= 11) { put16(r, 3, 32768); put16(r, 5, 32768); put16(r, 7, 32768); put16(r, 9, 32768); }
+                  }
+                  // dinput: 全 0 即回中(8-bit 有符号轴)
+                  return r;
+              }
+
+              private int reportSize() {
+                  if ("dinput".equals(profile) || "ps5".equals(profile)) return 9;
+                  if ("switch".equals(profile)) return 13;
+                  return 16;
               }
 
               private String nameOf(BluetoothDevice d) {
@@ -1212,6 +1331,14 @@ jobs:
                       i.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300);
                       startActivity(i);
                   } catch (Throwable t) { status = "无法设为可发现: " + t.getMessage(); }
+              }
+
+              private void enableBluetooth() {
+                  try {
+                      startActivity(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE));
+                  } catch (Throwable t) {
+                      status = "请在系统设置里打开蓝牙: " + t.getMessage();
+                  }
               }
 
               private List<List<String>> bonded() {
@@ -1381,23 +1508,26 @@ jobs:
                   int mask = (s[0] & 0xFF) | ((s[1] & 0xFF) << 8) | ((s[2] & 0xFF) << 16) | ((s[3] & 0xFF) << 24);
                   byte[] r;
                   if ("dinput".equals(profile)) {
-                       r = buildDinputReport(mask, s);
-                   } else if ("ps5".equals(profile)) {
-                       r = buildPs5Report(mask, s);
-                   } else if ("switch".equals(profile)) {
-                       r = buildSwitchReport(mask, s);
-                   } else {
-                       r = buildXboxReport(mask, s);
-                   }
-                   long now = System.nanoTime();
-                  boolean same = r.length == lastLen && Arrays.equals(Arrays.copyOf(lastReport, lastLen), r);
-                  if (same && now - lastSendNs < 500_000_000L) return;   // 无变化:仅 0.5s 心跳
-                  if (!same && now - lastSendNs < 2_000_000L) return;    // 最低 2ms 节流；蓝牙链路自身仍决定最终轮询频率
+                      r = buildDinputReport(mask, s);
+                  } else if ("ps5".equals(profile)) {
+                      r = buildPs5Report(mask, s);
+                  } else if ("switch".equals(profile)) {
+                      r = buildSwitchReport(mask, s);
+                  } else {
+                      r = buildXboxReport(mask, s);
+                  }
+                  long now = System.nanoTime();
+                  byte[] prev = lastReport;
+                  boolean same = prev.length == r.length && Arrays.equals(prev, r);
+                  // 状态没变:1s 一次保活足够;状态变了:最少间隔 4ms,避免把报告堆进蓝牙队列。
+                  // 被节流掉的那一帧不会丢:下一次 tick 送的是同样的最新状态,和 lastReport 仍然不同。
+                  long minGap = same ? 1_000_000_000L : 4_000_000L;
+                  if (now - lastSendNs < minGap) return;
                   try {
                       int reportId = "switch".equals(profile) ? 0x30 : 1;
-                       if (h.sendReport(host, reportId, r)) {
-                          System.arraycopy(r, 0, lastReport, 0, r.length);
-                          lastLen = r.length;
+                      if (h.sendReport(host, reportId, r)) {
+                          lastReport = r;        // 整块替换:读线程看到的永远是完整报告
+                          currentReport = r;
                           lastSendNs = now;
                       }
                   } catch (Throwable ignored) {}
@@ -1417,881 +1547,44 @@ jobs:
               '    <application'
           )
           assert "<application" in s
-          open(p, "w", encoding="utf-8").write(s.replace("<application", perms, 1))
+          s = s.replace("<application", perms, 1)
+
+          # 应用名和横屏锁:只影响外观,匹配不到就跳过,不能让构建失败
+          import glob
+          import re
+
+          if re.search(r'android:label="[^"]*"', s):
+              s = re.sub(r'android:label="[^"]*"',
+                         'android:label="Pro Virtual Gamepad"\n        android:screenOrientation="sensorLandscape"',
+                         s, count=1)
+          open(p, "w", encoding="utf-8").write(s)
           print("manifest patched")
-          
-          import glob, re
-          # Android 11 (API 30)+ only: BluetoothHidDevice needs API 28+, we target 30+
+
+          # BluetoothHidDevice 需要 API 28+。模板里通常是 "minSdk = flutter.minSdkVersion"
+          patched = False
           for g in glob.glob("android/app/build.gradle*"):
               t = open(g, encoding="utf-8").read()
-              t2 = re.sub(r"minSdk(Version)?(\s*=\s*|\s+)flutter\.minSdkVersion",
-                          lambda m: "minSdk = 30" if g.endswith(".kts") else "minSdkVersion 30", t)
-              assert t2 != t, "minSdk not patched in " + g
-              open(g, "w", encoding="utf-8").write(t2)
-              print("minSdk set to 30 in", g)
+              kts = g.endswith(".kts")
+              new = re.sub(r"minSdk(Version)?(\s*=\s*|\s+)flutter\.minSdkVersion",
+                           "minSdk = 28" if kts else "minSdkVersion 28", t)
+              if new == t:
+                  # 兜底:模板改成了字面量(例如 minSdk = 21 / minSdkVersion 21)
+                  new = re.sub(r"(minSdk(?:Version)?\s*(?:=\s*)?)\d+", r"\g<1>28", t, count=1)
+              assert new != t, "minSdk not patched in " + g
+              open(g, "w", encoding="utf-8").write(new)
+              patched = True
+              print("minSdk set to 28 in", g)
+          assert patched, "no android/app/build.gradle* found"
+
           EOF
           python3 patch_manifest.py
 
           flutter build apk --release
+
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
           name: Android-APK-Installer
           path: app_build/build/app/outputs/flutter-apk/app-release.apk
-
-  build-ios:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: 'stable'
-      - name: Generate Project and Build IPA
-        run: |
-          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
-          cd app_build
-
-          cat << 'EOF' > lib/main.dart
-          import 'dart:async';
-          import 'dart:convert';
-          import 'dart:math' as math;
-          import 'dart:typed_data';
-          import 'package:flutter/material.dart';
-          import 'package:flutter/services.dart';
-
-          void main() async {
-            WidgetsFlutterBinding.ensureInitialized();
-            await SystemChrome.setPreferredOrientations([
-              DeviceOrientation.landscapeLeft,
-              DeviceOrientation.landscapeRight,
-            ]);
-            await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-            runApp(const VirtualGamepadApp());
-          }
-
-          class VirtualGamepadApp extends StatelessWidget {
-            const VirtualGamepadApp({super.key});
-
-            @override
-            Widget build(BuildContext context) {
-              return MaterialApp(
-                title: 'Pro Virtual Gamepad',
-                debugShowCheckedModeBanner: false,
-                theme: ThemeData.dark().copyWith(
-                  scaffoldBackgroundColor: const Color(0xFF121418),
-                  colorScheme: const ColorScheme.dark(primary: Color(0xFF00E5FF)),
-                ),
-                home: const GamepadScreen(),
-              );
-            }
-          }
-
-          /// 逻辑按键顺序 = 发给原生层的 32 位掩码的位序。
-          const List<String> kBtnOrder = [
-            'BTN_A', 'BTN_B', 'BTN_X', 'BTN_Y', 'BTN_L1', 'BTN_R1', 'BTN_L2', 'BTN_R2',
-            'DPAD_UP', 'DPAD_DOWN', 'DPAD_LEFT', 'DPAD_RIGHT',
-            'BTN_SELECT', 'BTN_START', 'BTN_HOME', 'BTN_L3', 'BTN_R3',
-          ];
-
-          const Map<String, String> kXboxLabels = {
-            'BTN_A': 'A', 'BTN_B': 'B', 'BTN_X': 'X', 'BTN_Y': 'Y',
-            'BTN_L1': 'LB', 'BTN_R1': 'RB', 'BTN_L2': 'LT', 'BTN_R2': 'RT',
-            'DPAD_UP': '↑', 'DPAD_DOWN': '↓', 'DPAD_LEFT': '←', 'DPAD_RIGHT': '→',
-            'BTN_SELECT': 'View', 'BTN_START': 'Menu', 'BTN_HOME': 'Xbox', 'BTN_L3': 'LS', 'BTN_R3': 'RS',
-          };
-          const Map<String, String> kPsLabels = {
-            'BTN_A': '✕', 'BTN_B': '○', 'BTN_X': '□', 'BTN_Y': '△',
-            'BTN_L1': 'L1', 'BTN_R1': 'R1', 'BTN_L2': 'L2', 'BTN_R2': 'R2',
-            'DPAD_UP': '↑', 'DPAD_DOWN': '↓', 'DPAD_LEFT': '←', 'DPAD_RIGHT': '→',
-            'BTN_SELECT': 'Share', 'BTN_START': 'Options', 'BTN_HOME': 'PS', 'BTN_L3': 'L3', 'BTN_R3': 'R3',
-          };
-          // Switch 的 ABXY 位置与 Xbox 不同:同一物理位置上标签对调(下=B 右=A 左=Y 上=X)
-          const Map<String, String> kSwitchLabels = {
-            'BTN_A': 'B', 'BTN_B': 'A', 'BTN_X': 'Y', 'BTN_Y': 'X',
-            'BTN_L1': 'L', 'BTN_R1': 'R', 'BTN_L2': 'ZL', 'BTN_R2': 'ZR',
-            'DPAD_UP': '↑', 'DPAD_DOWN': '↓', 'DPAD_LEFT': '←', 'DPAD_RIGHT': '→',
-            'BTN_SELECT': '−', 'BTN_START': '+', 'BTN_HOME': 'Home', 'BTN_L3': 'LS', 'BTN_R3': 'RS',
-          };
-
-          class PadWidgetConfig {
-            final String id;
-            double xRatio;
-            double yRatio;
-            double scale;
-            String fn; // 这个屏幕按键实际发送的手柄功能(可在编辑模式里改)
-
-            PadWidgetConfig({required this.id, required this.xRatio, required this.yRatio, this.scale = 1.0, String? fn})
-                : fn = fn ?? id;
-
-            Map<String, dynamic> toJson() => {'id': id, 'xRatio': xRatio, 'yRatio': yRatio, 'scale': scale, 'fn': fn};
-
-            factory PadWidgetConfig.fromJson(Map<String, dynamic> json) => PadWidgetConfig(
-                  id: json['id'] as String,
-                  xRatio: (json['xRatio'] as num).toDouble(),
-                  yRatio: (json['yRatio'] as num).toDouble(),
-                  scale: (json['scale'] as num).toDouble(),
-                  fn: json['fn'] as String?,
-                );
-          }
-
-          List<PadWidgetConfig> defaultLayout() => [
-                PadWidgetConfig(id: 'LEFT_STICK', xRatio: 0.16, yRatio: 0.65, scale: 1.1),
-                PadWidgetConfig(id: 'RIGHT_STICK', xRatio: 0.78, yRatio: 0.65, scale: 1.15),
-                PadWidgetConfig(id: 'BTN_A', xRatio: 0.88, yRatio: 0.45),
-                PadWidgetConfig(id: 'BTN_B', xRatio: 0.94, yRatio: 0.32),
-                PadWidgetConfig(id: 'BTN_X', xRatio: 0.82, yRatio: 0.32),
-                PadWidgetConfig(id: 'BTN_Y', xRatio: 0.88, yRatio: 0.20),
-                PadWidgetConfig(id: 'BTN_L1', xRatio: 0.12, yRatio: 0.18),
-                PadWidgetConfig(id: 'BTN_L2', xRatio: 0.24, yRatio: 0.18),
-                PadWidgetConfig(id: 'BTN_R1', xRatio: 0.88, yRatio: 0.10),
-                PadWidgetConfig(id: 'BTN_R2', xRatio: 0.76, yRatio: 0.10),
-                PadWidgetConfig(id: 'DPAD_UP', xRatio: 0.32, yRatio: 0.45, scale: 0.9),
-                PadWidgetConfig(id: 'DPAD_DOWN', xRatio: 0.32, yRatio: 0.72, scale: 0.9),
-                PadWidgetConfig(id: 'DPAD_LEFT', xRatio: 0.26, yRatio: 0.58, scale: 0.9),
-                PadWidgetConfig(id: 'DPAD_RIGHT', xRatio: 0.38, yRatio: 0.58, scale: 0.9),
-                PadWidgetConfig(id: 'BTN_SELECT', xRatio: 0.43, yRatio: 0.30, scale: 0.8),
-                PadWidgetConfig(id: 'BTN_HOME', xRatio: 0.50, yRatio: 0.30, scale: 0.8),
-                PadWidgetConfig(id: 'BTN_START', xRatio: 0.57, yRatio: 0.30, scale: 0.8),
-                PadWidgetConfig(id: 'BTN_L3', xRatio: 0.06, yRatio: 0.42, scale: 0.75),
-                PadWidgetConfig(id: 'BTN_R3', xRatio: 0.66, yRatio: 0.42, scale: 0.75),
-              ];
-
-          class GamepadScreen extends StatefulWidget {
-            const GamepadScreen({super.key});
-
-            @override
-            State<GamepadScreen> createState() => _GamepadScreenState();
-          }
-
-          class _GamepadScreenState extends State<GamepadScreen> {
-            static const MethodChannel _ch = MethodChannel('com.gamepad.hid/bluetooth');
-
-            bool _isEditLayoutMode = false;
-            bool _isToolbarCollapsed = false;
-            bool _isRightStickSwipeMode = true;
-            bool _isGyroEnabled = false;
-            bool _gyroHoldL2 = false;
-            bool _gyroFlat = false;
-            bool _gyroInvX = false;
-            bool _gyroInvY = false;
-            int _labelStyle = 0; // 0 Xbox, 1 PS, 2 Switch(仅影响屏幕上的按键标签)
-            String _hidProfile = 'xbox'; // xbox | dinput
-            String _btStatus = '未连接 (点蓝牙图标)';
-            String? _selectedWidgetId;
-
-            double _leftStickSensitivity = 1.0;
-            double _rightStickSensitivity = 1.2;
-            double _swipeViewSensitivity = 1.5;
-            double _gyroSensitivity = 1.0;
-            double _stickDeadzone = 0.08;
-
-            final Set<String> _pressedButtons = {};
-            Offset _leftStickPos = Offset.zero;
-            Offset _rightStickPos = Offset.zero;
-            Offset _previewRight = Offset.zero;
-            double _swipeAccX = 0, _swipeAccY = 0;
-            Offset _swipeVel = Offset.zero;
-            List<double> _lastGyro = [0, 0, 0, 1];
-            bool _busy = false;
-            bool _again = false;
-
-            Timer? _sendTimer;
-            Timer? _uiTimer;
-            late List<PadWidgetConfig> _layoutConfigs;
-
-            @override
-            void initState() {
-              super.initState();
-              _layoutConfigs = defaultLayout();
-              _loadSavedLayout();
-              _sendTimer = Timer.periodic(const Duration(milliseconds: 8), (_) => _requestSend());
-              _uiTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) => _refreshStatus());
-            }
-
-            @override
-            void dispose() {
-              _sendTimer?.cancel();
-              _uiTimer?.cancel();
-              super.dispose();
-            }
-
-            String _label(String id) {
-              final m = _labelStyle == 1 ? kPsLabels : (_labelStyle == 2 ? kSwitchLabels : kXboxLabels);
-              return m[id] ?? id;
-            }
-
-            Future<void> _refreshStatus() async {
-              try {
-                final String? s = await _ch.invokeMethod<String>('getStatus');
-                if (mounted && s != null && s.isNotEmpty && s != _btStatus) setState(() => _btStatus = s);
-              } catch (_) {}
-            }
-
-            Future<void> _loadSavedLayout() async {
-              try {
-                final String? saved = await _ch.invokeMethod<String>('loadLayout');
-                if (saved != null && saved.isNotEmpty) {
-                  final List decoded = jsonDecode(saved) as List;
-                  final loaded = decoded.map((e) => PadWidgetConfig.fromJson(Map<String, dynamic>.from(e as Map))).toList();
-                  // 旧版本保存的布局里没有的新按键,用默认位置补上
-                  for (final d in defaultLayout()) {
-                    if (!loaded.any((e) => e.id == d.id)) loaded.add(d);
-                  }
-                  if (mounted) setState(() => _layoutConfigs = loaded);
-                }
-              } catch (_) {}
-            }
-
-            Future<void> _saveLayout() async {
-              try {
-                await _ch.invokeMethod('saveLayout', jsonEncode(_layoutConfigs.map((e) => e.toJson()).toList()));
-              } catch (_) {}
-            }
-
-            Offset _curve(Offset raw, double sens) {
-              final double mag = raw.distance;
-              if (mag <= _stickDeadzone) return Offset.zero;
-              final double n = ((mag - _stickDeadzone) / (1.0 - _stickDeadzone)).clamp(0.0, 1.0);
-              final double c = (math.pow(n, 1.2) * sens).clamp(0.0, 1.0).toDouble();
-              final double a = math.atan2(raw.dy, raw.dx);
-              return Offset(math.cos(a) * c, math.sin(a) * c);
-            }
-
-            Offset _gyroOutput() {
-              if (!_isGyroEnabled) return Offset.zero;
-              if (_gyroHoldL2 && !_pressedButtons.contains('BTN_L2')) return Offset.zero;
-              final gx = _lastGyro[0], gy = _lastGyro[1], gz = _lastGyro[2], s = _lastGyro[3];
-              double dz(double v) => v.abs() < 0.03 ? 0.0 : v;
-              // 掌机式横握:左右转身 = 绕 x 轴;平放:绕 z 轴
-              double yaw = _gyroFlat ? -dz(gz) : -dz(gx) * s;
-              double pitch = dz(gy) * s;
-              if (_gyroInvX) yaw = -yaw;
-              if (_gyroInvY) pitch = -pitch;
-              final k = 0.30 * _gyroSensitivity;
-              return Offset(yaw * k, pitch * k);
-            }
-
-            /// 任何输入变化立刻请求发送;发送中又有新变化则合并成"发完再发一次最新状态",不排队。
-            void _requestSend() {
-              if (_busy) { _again = true; return; }
-              _pump();
-            }
-
-            Future<void> _pump() async {
-              _busy = true;
-              try {
-                do {
-                  _again = false;
-                  await _sendOnce();
-                } while (_again);
-              } finally {
-                _busy = false;
-              }
-            }
-
-            Future<void> _sendOnce() async {
-              if (_isEditLayoutMode) return;
-              try {
-                if (_isRightStickSwipeMode) {
-                  final ix = _swipeAccX / 18.0 * _swipeViewSensitivity;
-                  final iy = _swipeAccY / 18.0 * _swipeViewSensitivity;
-                  _swipeVel = Offset(_swipeVel.dx * 0.5 + ix * 0.5, _swipeVel.dy * 0.5 + iy * 0.5);
-                } else {
-                  _swipeVel = Offset.zero;
-                }
-                _swipeAccX = 0;
-                _swipeAccY = 0;
-
-                final left = _curve(_leftStickPos, _leftStickSensitivity);
-                final base = _isRightStickSwipeMode ? _swipeVel : _curve(_rightStickPos, _rightStickSensitivity);
-                final g = _gyroOutput();
-                final right = Offset((base.dx + g.dx).clamp(-1.0, 1.0).toDouble(), (base.dy + g.dy).clamp(-1.0, 1.0).toDouble());
-                _previewRight = right;
-
-                int mask = 0;
-                for (int i = 0; i < kBtnOrder.length; i++) {
-                  if (_pressedButtons.contains(kBtnOrder[i])) mask |= (1 << i);
-                }
-                int s8(double v) => (v.clamp(-1.0, 1.0) * 127).round();
-
-                final Uint8List p = Uint8List(10);
-                final bd = ByteData.view(p.buffer);
-                bd.setUint32(0, mask, Endian.little);
-                bd.setInt8(4, s8(left.dx));
-                bd.setInt8(5, s8(left.dy));
-                bd.setInt8(6, s8(right.dx));
-                bd.setInt8(7, s8(right.dy));
-                bd.setUint8(8, _pressedButtons.contains('BTN_L2') ? 255 : 0);
-                bd.setUint8(9, _pressedButtons.contains('BTN_R2') ? 255 : 0);
-
-                final res = await _ch.invokeMethod<List<dynamic>>('sendState', p);
-                if (res != null && res.length >= 4) {
-                  _lastGyro = res.map((e) => (e as num).toDouble()).toList();
-                }
-              } catch (_) {}
-            }
-
-            // ---------------- 蓝牙 ----------------
-            Future<void> _startBluetooth() async {
-              try {
-                final String? r = await _ch.invokeMethod<String>('startHidProfile', _hidProfile);
-                if (r != null && mounted) setState(() => _btStatus = r);
-              } on PlatformException catch (e) {
-                if (mounted) setState(() => _btStatus = '蓝牙提示: ${e.message}');
-              } catch (e) {
-                if (mounted) setState(() => _btStatus = '蓝牙提示: $e');
-              }
-              if (mounted) _showConnectSheet();
-            }
-
-            Future<void> _showConnectSheet() async {
-              List<List<String>> bonded = [];
-              try {
-                final r = await _ch.invokeMethod<List<dynamic>>('getBonded');
-                if (r != null) bonded = r.map((e) => (e as List).map((x) => x.toString()).toList()).toList();
-              } catch (_) {}
-              if (!mounted) return;
-              showModalBottomSheet(
-                context: context,
-                backgroundColor: const Color(0xFF1B1F27),
-                builder: (ctx) => SafeArea(
-                  child: ListView(
-                    shrinkWrap: true,
-                    padding: const EdgeInsets.all(12),
-                    children: [
-                      const Text('连接方式', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
-                      ListTile(
-                        leading: const Icon(Icons.visibility),
-                        title: const Text('让手机可被发现 (首次配对)'),
-                        subtitle: const Text('然后在电脑/平板/电视的蓝牙设置里搜索并配对本手机'),
-                        onTap: () async {
-                          Navigator.pop(ctx);
-                          try { await _ch.invokeMethod('makeDiscoverable'); } catch (_) {}
-                        },
-                      ),
-                      const Divider(color: Colors.white24),
-                      if (bonded.isEmpty)
-                        const Padding(padding: EdgeInsets.all(12), child: Text('暂无已配对设备', style: TextStyle(color: Colors.white54))),
-                      for (final d in bonded)
-                        ListTile(
-                          leading: const Icon(Icons.bluetooth),
-                          title: Text(d[0]),
-                          subtitle: Text(d[1]),
-                          onTap: () async {
-                            Navigator.pop(ctx);
-                            try { await _ch.invokeMethod('connectHost', d[1]); } catch (_) {}
-                          },
-                        ),
-                    ],
-                  ),
-                ),
-              );
-            }
-
-            // ---------------- 界面 ----------------
-            @override
-            Widget build(BuildContext context) {
-              final Size screenSize = MediaQuery.of(context).size;
-              return Scaffold(
-                body: Stack(
-                  children: [
-                    if (_isRightStickSwipeMode && !_isEditLayoutMode)
-                      Positioned(
-                        left: screenSize.width * 0.45,
-                        top: 56,
-                        right: 0,
-                        bottom: 0,
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.translucent,
-                          onPanUpdate: _onSwipe,
-                          child: Container(
-                            decoration: const BoxDecoration(border: Border(left: BorderSide(color: Color(0x2600E5FF), width: 1))),
-                            alignment: Alignment.bottomRight,
-                            padding: const EdgeInsets.all(16),
-                            child: Text(
-                              '3D 自由滑屏视角区',
-                              style: const TextStyle(color: Color(0x7300E5FF), fontSize: 12),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ..._layoutConfigs.map((c) => _buildPositionedControl(c, screenSize)),
-                    if (!_isToolbarCollapsed)
-                      Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
-                    if (_isToolbarCollapsed)
-                      Positioned(
-                        top: 10,
-                        right: 12,
-                        child: Material(
-                          color: Colors.transparent,
-                          child: Container(
-                            decoration: BoxDecoration(
-                              color: const Color(0xCC000000),
-                              shape: BoxShape.circle,
-                              border: Border.all(color: Colors.white24),
-                            ),
-                            child: IconButton(
-                              tooltip: '展开设置',
-                              icon: const Icon(Icons.tune, color: Colors.cyanAccent, size: 20),
-                              onPressed: () => setState(() => _isToolbarCollapsed = false),
-                            ),
-                          ),
-                        ),
-                      ),
-                    if (_isEditLayoutMode && _selectedWidgetId != null)
-                      Positioned(
-                        bottom: 16,
-                        left: screenSize.width * 0.08,
-                        right: screenSize.width * 0.08,
-                        child: _buildScaleEditorBar(),
-                      ),
-                  ],
-                ),
-              );
-            }
-
-            void _onSwipe(DragUpdateDetails d) {
-              if (_isEditLayoutMode) return;
-              _swipeAccX += d.delta.dx;
-              _swipeAccY += d.delta.dy;
-            }
-
-            Widget _buildTopToolbar() {
-              return Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                decoration: BoxDecoration(
-                  color: const Color(0xA6000000),
-                  borderRadius: BorderRadius.circular(24),
-                  border: Border.all(color: Colors.white12),
-                ),
-                child: Row(
-                  children: [
-                    IconButton(
-                      icon: const Icon(Icons.bluetooth_connected, color: Colors.cyanAccent, size: 20),
-                      onPressed: _startBluetooth,
-                    ),
-                    Flexible(
-                      flex: 2,
-                      child: Text(_btStatus, maxLines: 1, overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 12, color: Colors.white70)),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      flex: 3,
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        reverse: true,
-                        child: Row(
-                          children: [
-                            FilterChip(
-                              label: Text(_isRightStickSwipeMode ? '右摇杆: 3D滑屏视角' : '右摇杆: 传统回中', style: const TextStyle(fontSize: 11)),
-                              selected: _isRightStickSwipeMode,
-                              onSelected: (v) => setState(() => _isRightStickSwipeMode = v),
-                            ),
-                            const SizedBox(width: 8),
-                            FilterChip(
-                              label: Text('陀螺仪体感 (${_gyroSensitivity.toStringAsFixed(1)}x)', style: const TextStyle(fontSize: 11)),
-                              selected: _isGyroEnabled,
-                              onSelected: (v) => setState(() => _isGyroEnabled = v),
-                            ),
-                            const SizedBox(width: 8),
-                            ElevatedButton.icon(
-                              icon: Icon(_isEditLayoutMode ? Icons.save : Icons.open_with, size: 15),
-                              label: Text(_isEditLayoutMode ? '保存布局' : '自定义按键', style: const TextStyle(fontSize: 12)),
-                              onPressed: () {
-                                setState(() => _isEditLayoutMode = !_isEditLayoutMode);
-                                if (!_isEditLayoutMode) _saveLayout();
-                              },
-                            ),
-                            IconButton(
-                              tooltip: '收起设置栏',
-                              icon: const Icon(Icons.keyboard_arrow_up, size: 20),
-                              onPressed: () => setState(() => _isToolbarCollapsed = true),
-                            ),
-                            IconButton(icon: const Icon(Icons.tune, size: 20), onPressed: _showSettingsSheet),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            }
-
-            Widget _buildPositionedControl(PadWidgetConfig cfg, Size screenSize) {
-              final bool isStick = cfg.id == 'LEFT_STICK' || cfg.id == 'RIGHT_STICK';
-              final double finalSize = (isStick ? 135.0 : 58.0) * cfg.scale;
-              final double left = (cfg.xRatio * screenSize.width) - finalSize / 2;
-              final double top = (cfg.yRatio * screenSize.height) - finalSize / 2;
-
-              Widget child;
-              if (cfg.id == 'LEFT_STICK') {
-                child = _buildAnalogStick(
-                  size: finalSize, label: 'L', value: _leftStickPos,
-                  onChanged: (v) { setState(() => _leftStickPos = v); _requestSend(); },
-                );
-              } else if (cfg.id == 'RIGHT_STICK') {
-                child = _isRightStickSwipeMode
-                    ? _buildSwipeZone(finalSize)
-                    : _buildAnalogStick(
-                        size: finalSize, label: 'R', value: _rightStickPos,
-                        onChanged: (v) { setState(() => _rightStickPos = v); _requestSend(); },
-                      );
-              } else {
-                child = _buildActionButton(cfg.fn, _label(cfg.fn), finalSize);
-              }
-              child = RepaintBoundary(child: child);
-
-              return Positioned(
-                left: left.clamp(0.0, math.max(0.0, screenSize.width - finalSize)).toDouble(),
-                top: top.clamp(0.0, math.max(0.0, screenSize.height - finalSize)).toDouble(),
-                child: _isEditLayoutMode
-                    ? GestureDetector(
-                        onTap: () => setState(() => _selectedWidgetId = cfg.id),
-                        onPanUpdate: (d) {
-                          setState(() {
-                            _selectedWidgetId = cfg.id;
-                            cfg.xRatio = ((cfg.xRatio * screenSize.width + d.delta.dx) / screenSize.width).clamp(0.04, 0.96).toDouble();
-                            cfg.yRatio = ((cfg.yRatio * screenSize.height + d.delta.dy) / screenSize.height).clamp(0.08, 0.94).toDouble();
-                          });
-                        },
-                        child: Container(
-                          decoration: BoxDecoration(
-                            border: Border.all(color: _selectedWidgetId == cfg.id ? Colors.amberAccent : Colors.redAccent, width: 2),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: AbsorbPointer(child: child),
-                        ),
-                      )
-                    : child,
-              );
-            }
-
-            Widget _buildAnalogStick({
-              required double size,
-              required String label,
-              required Offset value,
-              required ValueChanged<Offset> onChanged,
-            }) {
-              final double radius = size / 2;
-              final double knob = size * 0.22;
-              final double maxDist = math.max(1.0, radius - knob);
-
-              void update(Offset local) {
-                // X/Y 必须分别计算，不能把两个轴耦合在一起。
-                // 同时采用径向限幅，保证圆周边缘仍能得到完整的 ±1 范围。
-                final Offset delta = local - Offset(radius, radius);
-                final double dist = delta.distance;
-                Offset normalized;
-                if (dist > maxDist) {
-                  normalized = delta / dist;
-                } else {
-                  normalized = delta / maxDist;
-                }
-
-                double x = normalized.dx.clamp(-1.0, 1.0).toDouble();
-                double y = normalized.dy.clamp(-1.0, 1.0).toDouble();
-
-                // 小死区 + 等比例重映射，避免中心漂移，同时不破坏四个轴向。
-                const double dead = 0.06;
-                final double mag = math.sqrt(x * x + y * y);
-                if (mag < dead) {
-                  x = 0;
-                  y = 0;
-                } else if (mag > 0) {
-                  final double m = ((mag - dead) / (1.0 - dead)).clamp(0.0, 1.0).toDouble();
-                  x = x / mag * m;
-                  y = y / mag * m;
-                }
-                onChanged(Offset(x, y));
-              }
-
-              return GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onPanStart: (d) => update(d.localPosition),
-                onPanUpdate: (d) => update(d.localPosition),
-                onPanEnd: (_) { onChanged(Offset.zero); _requestSend(); },
-                onPanCancel: () { onChanged(Offset.zero); _requestSend(); },
-                child: Container(
-                  width: size,
-                  height: size,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: const Color(0x14FFFFFF),
-                    border: Border.all(color: const Color(0x6600E5FF), width: 2),
-                  ),
-                  child: Center(
-                    child: Transform.translate(
-                      offset: Offset(value.dx * (radius - knob), value.dy * (radius - knob)),
-                      child: Container(
-                        width: knob * 2,
-                        height: knob * 2,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Color(0xBF00E5FF),
-                          boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
-                        ),
-                        alignment: Alignment.center,
-                        child: Text(label, style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                  ),
-                ),
-              );
-            }
-
-            Widget _buildSwipeZone(double size) {
-              return GestureDetector(
-                onPanUpdate: _onSwipe,
-                child: Container(
-                  width: size * 1.25,
-                  height: size,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(20),
-                    color: const Color(0x1400E5FF),
-                    border: Border.all(color: const Color(0x8000E5FF), width: 1.5),
-                  ),
-                  child: const Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(Icons.touch_app, color: Colors.cyanAccent, size: 28),
-                      SizedBox(height: 4),
-                      Text('3D 滑屏视角触控区', style: TextStyle(fontSize: 11, color: Colors.cyanAccent)),
-                    ],
-                  ),
-                ),
-              );
-            }
-
-            Widget _buildActionButton(String id, String label, double size) {
-              final bool pressed = _pressedButtons.contains(id);
-              return Listener(
-                onPointerDown: _isEditLayoutMode ? null : (_) { setState(() => _pressedButtons.add(id)); _requestSend(); },
-                onPointerUp: _isEditLayoutMode ? null : (_) { setState(() => _pressedButtons.remove(id)); _requestSend(); },
-                onPointerCancel: _isEditLayoutMode ? null : (_) { setState(() => _pressedButtons.remove(id)); _requestSend(); },
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 50),
-                  width: size,
-                  height: size,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: pressed ? Colors.cyanAccent : const Color(0x1FFFFFFF),
-                    border: Border.all(color: pressed ? Colors.white : Colors.white38, width: 2),
-                  ),
-                  alignment: Alignment.center,
-                  child: Text(
-                    label,
-                    style: TextStyle(
-                      color: pressed ? Colors.black : Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: label.length > 2 ? size * 0.2 : size * 0.32,
-                    ),
-                  ),
-                ),
-              );
-            }
-
-            Widget _buildScaleEditorBar() {
-              final cfg = _layoutConfigs.firstWhere((e) => e.id == _selectedWidgetId, orElse: () => _layoutConfigs.first);
-              return Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.black87,
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: Colors.amberAccent),
-                ),
-                child: Row(
-                  children: [
-                    Text('选中: ${_label(cfg.fn)}', style: const TextStyle(color: Colors.amberAccent, fontSize: 13)),
-                    if (cfg.id != 'LEFT_STICK' && cfg.id != 'RIGHT_STICK') ...[
-                      const SizedBox(width: 8),
-                      const Text('功能:', style: TextStyle(fontSize: 12)),
-                      const SizedBox(width: 4),
-                      DropdownButton<String>(
-                        value: cfg.fn,
-                        dropdownColor: const Color(0xFF1B1F27),
-                        underline: const SizedBox.shrink(),
-                        items: kBtnOrder.map((k) => DropdownMenuItem(value: k, child: Text(_label(k)))).toList(),
-                        onChanged: (v) { if (v != null) setState(() => cfg.fn = v); },
-                      ),
-                    ],
-                    Expanded(
-                      child: Slider(value: cfg.scale, min: 0.5, max: 1.8, onChanged: (v) => setState(() => cfg.scale = v)),
-                    ),
-                    TextButton(
-                      onPressed: () {
-                        setState(() => _layoutConfigs = defaultLayout());
-                        _saveLayout();
-                      },
-                      child: const Text('重置全部', style: TextStyle(color: Colors.redAccent)),
-                    ),
-                  ],
-                ),
-              );
-            }
-
-            void _showSettingsSheet() {
-              showModalBottomSheet(
-                context: context,
-                isScrollControlled: true,
-                backgroundColor: const Color(0xFF1B1F27),
-                builder: (ctx) => StatefulBuilder(
-                  builder: (context, setM) {
-                    void both(VoidCallback f) { setM(f); setState(() {}); }
-                    return SafeArea(
-                      child: Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: SingleChildScrollView(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Text('设置', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
-                              const Divider(color: Colors.white24),
-                              const Text('手柄协议(蓝牙发给主机的类型)', style: TextStyle(fontSize: 13)),
-                              RadioListTile<String>(
-                                dense: true,
-                                title: const Text('Xbox 手柄布局 (Xbox One S 蓝牙描述符)'),
-                                subtitle: const Text('Android/Linux/多数安卓游戏按 Xbox 手柄识别'),
-                                value: 'xbox', groupValue: _hidProfile,
-                                onChanged: (v) => both(() => _hidProfile = v!),
-                              ),
-                              RadioListTile<String>(
-                                dense: true,
-                                title: const Text('通用 DirectInput 手柄'),
-                                subtitle: const Text('Windows 老游戏 / 模拟器'),
-                                value: 'dinput', groupValue: _hidProfile,
-                                onChanged: (v) => both(() => _hidProfile = v!),
-                              ),
-                              const ListTile(
-                                dense: true,
-                                enabled: false,
-                                title: Text('PS5 DualSense / Switch Pro (真机协议)'),
-                                subtitle: Text('暂未实现:需要专用握手协议,见说明'),
-                              ),
-                              const Text('切换协议后,点蓝牙图标重新启动;主机端需删除旧配对再重新配对。',
-                                  style: TextStyle(fontSize: 11, color: Colors.amberAccent)),
-                              const SizedBox(height: 8),
-                              const Text('屏幕按键样式(只改标签和位置含义,不改协议)', style: TextStyle(fontSize: 13)),
-                              SegmentedButton<int>(
-                                segments: const [
-                                  ButtonSegment(value: 0, label: Text('Xbox')),
-                                  ButtonSegment(value: 1, label: Text('PlayStation')),
-                                  ButtonSegment(value: 2, label: Text('Switch')),
-                                ],
-                                selected: {_labelStyle},
-                                onSelectionChanged: (s) => both(() => _labelStyle = s.first),
-                              ),
-                              SwitchListTile(
-                                dense: true,
-                                title: const Text('右摇杆改为“3D手游随意滑屏控制视角”'),
-                                value: _isRightStickSwipeMode,
-                                onChanged: (v) => both(() => _isRightStickSwipeMode = v),
-                              ),
-                              _slider('左摇杆灵敏度', _leftStickSensitivity, 0.2, 2.5, (v) => both(() => _leftStickSensitivity = v)),
-                              _slider('右摇杆(传统)灵敏度', _rightStickSensitivity, 0.2, 2.5, (v) => both(() => _rightStickSensitivity = v)),
-                              _slider('右摇杆(滑屏视角)灵敏度', _swipeViewSensitivity, 0.3, 4.0, (v) => both(() => _swipeViewSensitivity = v)),
-                              _slider('摇杆中心死区', _stickDeadzone, 0.0, 0.30, (v) => both(() => _stickDeadzone = v)),
-                              const Divider(color: Colors.white24),
-                              SwitchListTile(dense: true, title: const Text('陀螺仪体感(叠加到右摇杆)'), value: _isGyroEnabled, onChanged: (v) => both(() => _isGyroEnabled = v)),
-                              _slider('体感灵敏度', _gyroSensitivity, 0.1, 4.0, (v) => both(() => _gyroSensitivity = v)),
-                              SwitchListTile(dense: true, title: const Text('仅按住 L2/LT/ZL 时启用体感'), value: _gyroHoldL2, onChanged: (v) => both(() => _gyroHoldL2 = v)),
-                              SwitchListTile(dense: true, title: const Text('手机平放使用(默认为横握)'), value: _gyroFlat, onChanged: (v) => both(() => _gyroFlat = v)),
-                              SwitchListTile(dense: true, title: const Text('体感水平方向反向'), value: _gyroInvX, onChanged: (v) => both(() => _gyroInvX = v)),
-                              SwitchListTile(dense: true, title: const Text('体感垂直方向反向'), value: _gyroInvY, onChanged: (v) => both(() => _gyroInvY = v)),
-                            ],
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              );
-            }
-
-            Widget _slider(String title, double value, double min, double max, ValueChanged<double> onChanged) {
-              return Row(
-                children: [
-                  SizedBox(width: 200, child: Text('$title (${value.toStringAsFixed(2)})', style: const TextStyle(fontSize: 13))),
-                  Expanded(child: Slider(value: value.clamp(min, max).toDouble(), min: min, max: max, onChanged: onChanged)),
-                ],
-              );
-            }
-          }
-          EOF
-
-          cat << 'EOF' > ios/Runner/AppDelegate.swift
-          import UIKit
-          import Flutter
-          import CoreMotion
-
-          @main
-          @objc class AppDelegate: FlutterAppDelegate {
-            private let motionManager = CMMotionManager()
-            private var gyroX: Double = 0.0
-            private var gyroY: Double = 0.0
-            private var gyroZ: Double = 0.0
-
-            override func application(
-              _ application: UIApplication,
-              didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
-            ) -> Bool {
-              GeneratedPluginRegistrant.register(with: self)
-
-              var messenger: FlutterBinaryMessenger? = nil
-              if let controller = window?.rootViewController as? FlutterViewController {
-                messenger = controller.binaryMessenger
-              } else {
-                messenger = self.registrar(forPlugin: "GamepadBridge")?.messenger()
-              }
-
-              if motionManager.isGyroAvailable {
-                motionManager.gyroUpdateInterval = 1.0 / 60.0
-                motionManager.startGyroUpdates(to: .main) { [weak self] (data, _) in
-                  guard let self = self, let rate = data?.rotationRate else { return }
-                  self.gyroX = rate.x
-                  self.gyroY = rate.y
-                  self.gyroZ = rate.z
-                }
-              }
-
-              if let messenger = messenger {
-                let channel = FlutterMethodChannel(name: "com.gamepad.hid/bluetooth", binaryMessenger: messenger)
-                let note = "iOS 不允许 App 充当蓝牙手柄:此版本仅为界面/体感预览"
-                channel.setMethodCallHandler { [weak self] (call: FlutterMethodCall, result: @escaping FlutterResult) in
-                  guard let self = self else { return }
-                  switch call.method {
-                  case "sendState":
-                    result([self.gyroX, self.gyroY, self.gyroZ, 1.0])
-                  case "getStatus", "startHidProfile":
-                    result(note)
-                  case "getBonded":
-                    result([])
-                  case "saveLayout":
-                    if let s = call.arguments as? String { UserDefaults.standard.set(s, forKey: "custom_gamepad_layout_v1") }
-                    result(true)
-                  case "loadLayout":
-                    result(UserDefaults.standard.string(forKey: "custom_gamepad_layout_v1"))
-                  case "makeDiscoverable", "connectHost":
-                    result(nil)
-                  default:
-                    result(FlutterMethodNotImplemented)
-                  }
-                }
-              }
-
-              return super.application(application, didFinishLaunchingWithOptions: launchOptions)
-            }
-          }
-          EOF
-
-          plutil -replace NSMotionUsageDescription -string "使用陀螺仪模拟原生体感控制" ios/Runner/Info.plist
-          flutter build ios --release --no-codesign
-          mkdir -p Payload
-          cp -r build/ios/iphoneos/Runner.app Payload/
-          zip -r VirtualGamepad-iOS.ipa Payload
-      - name: Upload iOS IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: iOS-IPA-Installer
-          path: app_build/VirtualGamepad-iOS.ipa
+          if-no-files-found: error
+          retention-days: 30
