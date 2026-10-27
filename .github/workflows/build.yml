@@ -154,6 +154,9 @@ jobs:
             String _hidProfile = 'xbox'; // xbox | dinput | ps5 | switch
             String _btStatus = '未连接 (点蓝牙图标)';
             String? _selectedWidgetId;
+            bool _showDebug = false;
+            Offset _dbgL = Offset.zero, _dbgR = Offset.zero;
+            int _dbgUiMs = 0;
 
             double _leftStickSensitivity = 1.0;
             double _rightStickSensitivity = 1.2;
@@ -311,6 +314,15 @@ jobs:
                 final g = _gyroOutput();
                 final right = Offset((base.dx + g.dx).clamp(-1.0, 1.0).toDouble(), (base.dy + g.dy).clamp(-1.0, 1.0).toDouble());
                 _previewRight = right;
+                _dbgL = left;
+                _dbgR = right;
+                if (_showDebug) {
+                  final int ms = DateTime.now().millisecondsSinceEpoch;
+                  if (ms - _dbgUiMs > 100) {
+                    _dbgUiMs = ms;
+                    if (mounted) setState(() {});
+                  }
+                }
 
                 int mask = 0;
                 for (int i = 0; i < kBtnOrder.length; i++) {
@@ -404,6 +416,26 @@ jobs:
               );
             }
 
+            String _debugText() {
+              String f(Offset o) => '${o.dx.toStringAsFixed(2)},${o.dy.toStringAsFixed(2)}';
+              final String b = _pressedButtons.isEmpty ? '-' : _pressedButtons.map(_label).join(',');
+              return 'L ${f(_dbgL)}   R ${f(_dbgR)}   按键: $b';
+            }
+
+            /// 进编辑模式前给主机补一帧"全松开":编辑模式下不发送报告,
+            /// 否则手上按着的键 / 摇杆会一直卡在主机那头。
+            Future<void> _flushNeutral() async {
+              try {
+                final Uint8List p = Uint8List(10);
+                final ByteData bd = ByteData.view(p.buffer);
+                bd.setUint32(0, 0, Endian.little);
+                for (int i = 4; i < 10; i++) {
+                  bd.setUint8(i, 0);
+                }
+                await _ch.invokeMethod<List<dynamic>>('sendState', p);
+              } catch (_) {}
+            }
+
             // ---------------- 界面 ----------------
             @override
             Widget build(BuildContext context) {
@@ -432,6 +464,24 @@ jobs:
                         ),
                       ),
                     ..._layoutConfigs.map((c) => _buildPositionedControl(c, screenSize)),
+                    if (_showDebug && !_isEditLayoutMode)
+                      Positioned(
+                        top: 52,
+                        left: 0,
+                        right: 0,
+                        child: IgnorePointer(
+                          child: Center(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: const Color(0xCC000000),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(_debugText(), style: const TextStyle(fontSize: 11, color: Color(0xFF7CFFB2))),
+                            ),
+                          ),
+                        ),
+                      ),
                     if (!_isToolbarCollapsed)
                       Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
                     if (_isToolbarCollapsed)
@@ -516,8 +566,16 @@ jobs:
                               icon: Icon(_isEditLayoutMode ? Icons.save : Icons.open_with, size: 15),
                               label: Text(_isEditLayoutMode ? '保存布局' : '自定义按键', style: const TextStyle(fontSize: 12)),
                               onPressed: () {
-                                setState(() => _isEditLayoutMode = !_isEditLayoutMode);
-                                if (!_isEditLayoutMode) _saveLayout();
+                                final bool entering = !_isEditLayoutMode;
+                                if (entering) {
+                                  _pressedButtons.clear();
+                                  _leftStickPos = Offset.zero;
+                                  _rightStickPos = Offset.zero;
+                                  _swipeVel = Offset.zero;
+                                  unawaited(_flushNeutral());
+                                }
+                                setState(() => _isEditLayoutMode = entering);
+                                if (!entering) _saveLayout();
                               },
                             ),
                             IconButton(
@@ -815,6 +873,12 @@ jobs:
                               _slider('右摇杆(传统)灵敏度', _rightStickSensitivity, 0.2, 2.5, (v) => both(() => _rightStickSensitivity = v)),
                               _slider('右摇杆(滑屏视角)灵敏度', _swipeViewSensitivity, 0.3, 4.0, (v) => both(() => _swipeViewSensitivity = v)),
                               _slider('摇杆中心死区', _stickDeadzone, 0.0, 0.30, (v) => both(() => _stickDeadzone = v)),
+                              SwitchListTile(
+                                dense: true,
+                                title: const Text('显示正在发送的摇杆值(排查映射用)'),
+                                value: _showDebug,
+                                onChanged: (v) => both(() => _showDebug = v),
+                              ),
                               const Divider(color: Colors.white24),
                               SwitchListTile(dense: true, title: const Text('陀螺仪体感(叠加到右摇杆)'), value: _isGyroEnabled, onChanged: (v) => both(() => _isGyroEnabled = v)),
                               _slider('体感灵敏度', _gyroSensitivity, 0.1, 4.0, (v) => both(() => _gyroSensitivity = v)),
