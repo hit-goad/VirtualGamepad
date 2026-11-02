@@ -1,30 +1,40 @@
-name: Build Android APK (Bluetooth HID Gamepad)
+# Virtual Gamepad —— 优化版 workflow
+# 关键改动:
+#  1) 摇杆输入改成逐轴换算(X/Y 完全独立)+ 按指针 id 追踪,
+#     不再经过 PanGestureRecognizer(18px 拖动阈值 / 与外层滑屏区抢手势),
+#     八个方向都能各自到满量程 —— 修掉“只有左上和右下两个方向”。
+#  2) 新增“左摇杆八向数字(十字键)”模式 + 实时轴读数 HUD,方便对照映射是否有漏方向。
+#  3) Android 11+ 适配:12/13/14/15 的 BLUETOOTH_CONNECT/ADVERTISE 运行时权限、
+#     权限被拒后的正确回退、HID 注册重试、应答主机的 GET_REPORT(否则会被判无响应踢掉)、
+#     常亮屏、Android 12 的 android:exported 兜底。
+#  4) 空闲时不再 4ms 无脑刷 MethodChannel,只在真的有输入时才推报告。
+name: Auto Build APK (Android 11+ / 全向摇杆)
 
 on:
   push:
   workflow_dispatch:
 
-concurrency:
-  group: apk-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build-android:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
+
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
           cache: true
+
       - name: Generate Project and Build APK
         run: |
-          flutter create --org com.example --project-name virtual_gamepad --platforms=android -a java app_build
+          set -e
+
+          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
           cd app_build
 
           cat << 'EOF' > lib/main.dart
@@ -32,12 +42,13 @@ jobs:
           import 'dart:convert';
           import 'dart:math' as math;
           import 'dart:typed_data';
+
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
 
           void main() async {
             WidgetsFlutterBinding.ensureInitialized();
-            await SystemChrome.setPreferredOrientations([
+            await SystemChrome.setPreferredOrientations(const [
               DeviceOrientation.landscapeLeft,
               DeviceOrientation.landscapeRight,
             ]);
@@ -75,12 +86,14 @@ jobs:
             'DPAD_UP': '↑', 'DPAD_DOWN': '↓', 'DPAD_LEFT': '←', 'DPAD_RIGHT': '→',
             'BTN_SELECT': 'View', 'BTN_START': 'Menu', 'BTN_HOME': 'Xbox', 'BTN_L3': 'LS', 'BTN_R3': 'RS',
           };
+
           const Map<String, String> kPsLabels = {
             'BTN_A': '✕', 'BTN_B': '○', 'BTN_X': '□', 'BTN_Y': '△',
             'BTN_L1': 'L1', 'BTN_R1': 'R1', 'BTN_L2': 'L2', 'BTN_R2': 'R2',
             'DPAD_UP': '↑', 'DPAD_DOWN': '↓', 'DPAD_LEFT': '←', 'DPAD_RIGHT': '→',
             'BTN_SELECT': 'Share', 'BTN_START': 'Options', 'BTN_HOME': 'PS', 'BTN_L3': 'L3', 'BTN_R3': 'R3',
           };
+
           // Switch 的 ABXY 位置与 Xbox 不同:同一物理位置上标签对调(下=B 右=A 左=Y 上=X)
           const Map<String, String> kSwitchLabels = {
             'BTN_A': 'B', 'BTN_B': 'A', 'BTN_X': 'Y', 'BTN_Y': 'X',
@@ -105,7 +118,7 @@ jobs:
                   id: json['id'] as String,
                   xRatio: (json['xRatio'] as num).toDouble(),
                   yRatio: (json['yRatio'] as num).toDouble(),
-                  scale: (json['scale'] as num).toDouble(),
+                  scale: (json['scale'] as num?)?.toDouble() ?? 1.0,
                   fn: json['fn'] as String?,
                 );
           }
@@ -142,32 +155,39 @@ jobs:
           class _GamepadScreenState extends State<GamepadScreen> {
             static const MethodChannel _ch = MethodChannel('com.gamepad.hid/bluetooth');
 
+            // 摇杆编号:0 = 左摇杆, 1 = 右摇杆
+            static const int _left = 0;
+            static const int _right = 1;
+
             bool _isEditLayoutMode = false;
             bool _isToolbarCollapsed = false;
-            bool _isRightStickSwipeMode = true;
+            bool _isRightStickSwipeMode = false;
             bool _isGyroEnabled = false;
             bool _gyroHoldL2 = false;
             bool _gyroFlat = false;
             bool _gyroInvX = false;
             bool _gyroInvY = false;
+            bool _leftDigital = false; // 左摇杆八向数字:给只认十字键的老游戏/映射工具
+            bool _hudOn = true;
             int _labelStyle = 0; // 0 Xbox, 1 PS, 2 Switch(仅影响屏幕上的按键标签)
             String _hidProfile = 'xbox'; // xbox | dinput | ps5 | switch
             String _btStatus = '未连接 (点蓝牙图标)';
             String? _selectedWidgetId;
-            bool _showDebug = false;
-            Offset _dbgL = Offset.zero, _dbgR = Offset.zero;
-            int _dbgUiMs = 0;
 
             double _leftStickSensitivity = 1.0;
             double _rightStickSensitivity = 1.2;
             double _swipeViewSensitivity = 1.5;
             double _gyroSensitivity = 1.0;
-            double _stickDeadzone = 0.08;
+            double _stickDeadzone = 0.06;
+            double _digitalThreshold = 0.35;
 
             final Set<String> _pressedButtons = {};
             Offset _leftStickPos = Offset.zero;
             Offset _rightStickPos = Offset.zero;
-            Offset _previewRight = Offset.zero;
+            Offset _outLeft = Offset.zero;
+            Offset _outRight = Offset.zero;
+            int _maskNow = 0;
+            final List<int?> _stickPointer = <int?>[null, null];
             double _swipeAccX = 0, _swipeAccY = 0;
             Offset _swipeVel = Offset.zero;
             List<double> _lastGyro = [0, 0, 0, 1];
@@ -178,17 +198,19 @@ jobs:
             Timer? _sendTimer;
             Timer? _inputTicker;
             Timer? _uiTimer;
+            Timer? _hudTimer;
             late List<PadWidgetConfig> _layoutConfigs;
 
             @override
             void initState() {
-              _startInputTicker();
               super.initState();
               _layoutConfigs = defaultLayout();
               _loadSavedLayout();
-              // 不再用固定 8ms 全量轮询；输入变化后最多延迟约 2ms 再打包一次，
-              // 避免 Flutter Timer + MethodChannel 排队造成的额外输入延迟。
+              _startInputTicker();
               _uiTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) => _refreshStatus());
+              _hudTimer = Timer.periodic(const Duration(milliseconds: 120), (_) {
+                if (_hudOn && !_isEditLayoutMode && mounted) setState(() {});
+              });
             }
 
             @override
@@ -196,12 +218,19 @@ jobs:
               _inputTicker?.cancel();
               _sendTimer?.cancel();
               _uiTimer?.cancel();
+              _hudTimer?.cancel();
               super.dispose();
             }
 
             String _label(String id) {
-              final m = _labelStyle == 1 ? kPsLabels : (_labelStyle == 2 ? kSwitchLabels : kXboxLabels);
+              final Map<String, String> m =
+                  _labelStyle == 1 ? kPsLabels : (_labelStyle == 2 ? kSwitchLabels : kXboxLabels);
               return m[id] ?? id;
+            }
+
+            static int _bitOf(String id) {
+              final int i = kBtnOrder.indexOf(id);
+              return i < 0 ? 0 : (1 << i);
             }
 
             Future<void> _refreshStatus() async {
@@ -216,7 +245,9 @@ jobs:
                 final String? saved = await _ch.invokeMethod<String>('loadLayout');
                 if (saved != null && saved.isNotEmpty) {
                   final List decoded = jsonDecode(saved) as List;
-                  final loaded = decoded.map((e) => PadWidgetConfig.fromJson(Map<String, dynamic>.from(e as Map))).toList();
+                  final loaded = decoded
+                      .map((e) => PadWidgetConfig.fromJson(Map<String, dynamic>.from(e as Map)))
+                      .toList();
                   // 旧版本保存的布局里没有的新按键,用默认位置补上
                   for (final d in defaultLayout()) {
                     if (!loaded.any((e) => e.id == d.id)) loaded.add(d);
@@ -232,13 +263,17 @@ jobs:
               } catch (_) {}
             }
 
+            /// 逐轴处理:X 和 Y 完全独立,不做极坐标合成,所以八个方向都能各自到达满量程。
             Offset _curve(Offset raw, double sens) {
-              final double mag = raw.distance;
-              if (mag <= _stickDeadzone) return Offset.zero;
-              final double n = ((mag - _stickDeadzone) / (1.0 - _stickDeadzone)).clamp(0.0, 1.0);
-              final double c = (math.pow(n, 1.2) * sens).clamp(0.0, 1.0).toDouble();
-              final double a = math.atan2(raw.dy, raw.dx);
-              return Offset(math.cos(a) * c, math.sin(a) * c);
+              double axis(double v) {
+                final double a = v.abs();
+                if (a <= _stickDeadzone) return 0.0;
+                final double n = ((a - _stickDeadzone) / (1.0 - _stickDeadzone)).clamp(0.0, 1.0).toDouble();
+                final double c = (n * sens).clamp(0.0, 1.0).toDouble();
+                return v < 0 ? -c : c;
+              }
+
+              return Offset(axis(raw.dx), axis(raw.dy));
             }
 
             Offset _gyroOutput() {
@@ -255,10 +290,7 @@ jobs:
               return Offset(yaw * k, pitch * k);
             }
 
-            /// 低延迟输入调度：
-            /// - 不再每 8ms 无条件发送；
-            /// - 有输入变化时只保留一个待发送任务，2ms 内的多次触摸合并为最新状态；
-            /// - 如果蓝牙发送尚未完成，只发送最新状态，不堆积旧报告。
+            /// 低延迟输入调度：有输入变化时只保留一个待发送任务，2ms 内的多次触摸合并为最新状态。
             void _requestSend() {
               if (_isEditLayoutMode || _sendQueued) return;
               _sendQueued = true;
@@ -269,14 +301,21 @@ jobs:
               });
             }
 
+            bool _needStreaming() {
+              if (_isEditLayoutMode) return false;
+              if (_isGyroEnabled) return true;
+              if (_pressedButtons.isNotEmpty) return true;
+              if (_leftStickPos != Offset.zero || _rightStickPos != Offset.zero) return true;
+              if (_swipeVel != Offset.zero) return true;
+              if (_swipeAccX != 0 || _swipeAccY != 0) return true;
+              return false;
+            }
+
             void _startInputTicker() {
               _inputTicker?.cancel();
-              // 只有"连续量"需要定时发送:陀螺仪体感和滑屏视角。纯按键/摇杆由触摸事件触发,
-              // 空闲时一次也不发。原来 4ms 无条件全量发送(约 250 次/秒)远超蓝牙 HID 的连接间隔
-              // (约 11ms),报告只能在链路里排队,表现就是越推越迟、松手后手柄还在动。
-              _inputTicker = Timer.periodic(const Duration(milliseconds: 8), (_) {
-                if (_isEditLayoutMode) return;
-                if (_isGyroEnabled || _isRightStickSwipeMode) _requestSend();
+              // 只在真的有输入(或陀螺仪开着)时才推送,空闲时完全不占蓝牙和 CPU。
+              _inputTicker = Timer.periodic(const Duration(milliseconds: 6), (_) {
+                if (_needStreaming()) _requestSend();
               });
             }
 
@@ -296,6 +335,18 @@ jobs:
               }
             }
 
+            void _setStick(int kind, Offset v) {
+              if (!mounted) return;
+              setState(() {
+                if (kind == _left) {
+                  _leftStickPos = v;
+                } else {
+                  _rightStickPos = v;
+                }
+              });
+              _requestSend();
+            }
+
             Future<void> _sendOnce() async {
               if (_isEditLayoutMode) return;
               try {
@@ -309,29 +360,35 @@ jobs:
                 _swipeAccX = 0;
                 _swipeAccY = 0;
 
-                final left = _curve(_leftStickPos, _leftStickSensitivity);
-                final base = _isRightStickSwipeMode ? _swipeVel : _curve(_rightStickPos, _rightStickSensitivity);
-                final g = _gyroOutput();
-                final right = Offset((base.dx + g.dx).clamp(-1.0, 1.0).toDouble(), (base.dy + g.dy).clamp(-1.0, 1.0).toDouble());
-                _previewRight = right;
-                _dbgL = left;
-                _dbgR = right;
-                if (_showDebug) {
-                  final int ms = DateTime.now().millisecondsSinceEpoch;
-                  if (ms - _dbgUiMs > 100) {
-                    _dbgUiMs = ms;
-                    if (mounted) setState(() {});
-                  }
-                }
+                Offset left = _curve(_leftStickPos, _leftStickSensitivity);
+                final Offset base = _isRightStickSwipeMode ? _swipeVel : _curve(_rightStickPos, _rightStickSensitivity);
+                final Offset g = _gyroOutput();
+                final Offset right = Offset(
+                  (base.dx + g.dx).clamp(-1.0, 1.0).toDouble(),
+                  (base.dy + g.dy).clamp(-1.0, 1.0).toDouble(),
+                );
 
                 int mask = 0;
                 for (int i = 0; i < kBtnOrder.length; i++) {
                   if (_pressedButtons.contains(kBtnOrder[i])) mask |= (1 << i);
                 }
+                if (_leftDigital) {
+                  // 八向数字模式:摇杆方向转换成十字键位(斜向 = 两个位同时置位),模拟量归零。
+                  if (left.dy < -_digitalThreshold) mask |= _bitOf('DPAD_UP');
+                  if (left.dy > _digitalThreshold) mask |= _bitOf('DPAD_DOWN');
+                  if (left.dx < -_digitalThreshold) mask |= _bitOf('DPAD_LEFT');
+                  if (left.dx > _digitalThreshold) mask |= _bitOf('DPAD_RIGHT');
+                  left = Offset.zero;
+                }
+
+                _outLeft = left;
+                _outRight = right;
+                _maskNow = mask;
+
                 int s8(double v) => (v.clamp(-1.0, 1.0) * 127).round();
 
                 final Uint8List p = Uint8List(10);
-                final bd = ByteData.view(p.buffer);
+                final ByteData bd = ByteData.view(p.buffer);
                 bd.setUint32(0, mask, Endian.little);
                 bd.setInt8(4, s8(left.dx));
                 bd.setInt8(5, s8(left.dy));
@@ -340,8 +397,7 @@ jobs:
                 bd.setUint8(8, _pressedButtons.contains('BTN_L2') ? 255 : 0);
                 bd.setUint8(9, _pressedButtons.contains('BTN_R2') ? 255 : 0);
 
-                // 输入发送不再等待原生层返回，避免 MethodChannel 往返把下一帧卡住。
-                // 陀螺仪按 60Hz 独立刷新即可，不应阻塞手柄输入通道。
+                // 不等待原生返回,避免 MethodChannel 往返卡住下一帧。
                 unawaited(_ch.invokeMethod<List<dynamic>>('sendState', p).then((res) {
                   if (res != null && res.length >= 4) {
                     _lastGyro = res.map((e) => (e as num).toDouble()).toList();
@@ -378,28 +434,24 @@ jobs:
                     shrinkWrap: true,
                     padding: const EdgeInsets.all(12),
                     children: [
-                      const Text('连接方式', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
+                      const Text('连接方式',
+                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
                       ListTile(
                         leading: const Icon(Icons.visibility),
                         title: const Text('让手机可被发现 (首次配对)'),
                         subtitle: const Text('然后在电脑/平板/电视的蓝牙设置里搜索并配对本手机'),
                         onTap: () async {
                           Navigator.pop(ctx);
-                          try { await _ch.invokeMethod('makeDiscoverable'); } catch (_) {}
-                        },
-                      ),
-                      ListTile(
-                        leading: const Icon(Icons.bluetooth_disabled),
-                        title: const Text('打开系统蓝牙'),
-                        subtitle: const Text('连不上电脑时,先确认手机蓝牙已打开'),
-                        onTap: () async {
-                          Navigator.pop(ctx);
-                          try { await _ch.invokeMethod('enableBluetooth'); } catch (_) {}
+                          try {
+                            await _ch.invokeMethod('makeDiscoverable');
+                          } catch (_) {}
                         },
                       ),
                       const Divider(color: Colors.white24),
                       if (bonded.isEmpty)
-                        const Padding(padding: EdgeInsets.all(12), child: Text('暂无已配对设备', style: TextStyle(color: Colors.white54))),
+                        const Padding(
+                            padding: EdgeInsets.all(12),
+                            child: Text('暂无已配对设备', style: TextStyle(color: Colors.white54))),
                       for (final d in bonded)
                         ListTile(
                           leading: const Icon(Icons.bluetooth),
@@ -407,33 +459,15 @@ jobs:
                           subtitle: Text(d[1]),
                           onTap: () async {
                             Navigator.pop(ctx);
-                            try { await _ch.invokeMethod('connectHost', d[1]); } catch (_) {}
+                            try {
+                              await _ch.invokeMethod('connectHost', d[1]);
+                            } catch (_) {}
                           },
                         ),
                     ],
                   ),
                 ),
               );
-            }
-
-            String _debugText() {
-              String f(Offset o) => '${o.dx.toStringAsFixed(2)},${o.dy.toStringAsFixed(2)}';
-              final String b = _pressedButtons.isEmpty ? '-' : _pressedButtons.map(_label).join(',');
-              return 'L ${f(_dbgL)}   R ${f(_dbgR)}   按键: $b';
-            }
-
-            /// 进编辑模式前给主机补一帧"全松开":编辑模式下不发送报告,
-            /// 否则手上按着的键 / 摇杆会一直卡在主机那头。
-            Future<void> _flushNeutral() async {
-              try {
-                final Uint8List p = Uint8List(10);
-                final ByteData bd = ByteData.view(p.buffer);
-                bd.setUint32(0, 0, Endian.little);
-                for (int i = 4; i < 10; i++) {
-                  bd.setUint8(i, 0);
-                }
-                await _ch.invokeMethod<List<dynamic>>('sendState', p);
-              } catch (_) {}
             }
 
             // ---------------- 界面 ----------------
@@ -453,37 +487,18 @@ jobs:
                           behavior: HitTestBehavior.translucent,
                           onPanUpdate: _onSwipe,
                           child: Container(
-                            decoration: const BoxDecoration(border: Border(left: BorderSide(color: Color(0x2600E5FF), width: 1))),
+                            decoration: const BoxDecoration(
+                                border: Border(left: BorderSide(color: Color(0x2600E5FF), width: 1))),
                             alignment: Alignment.bottomRight,
                             padding: const EdgeInsets.all(16),
-                            child: Text(
-                              '3D 自由滑屏视角区',
-                              style: const TextStyle(color: Color(0x7300E5FF), fontSize: 12),
-                            ),
+                            child: const Text('3D 自由滑屏视角区',
+                                style: TextStyle(color: Color(0x7300E5FF), fontSize: 12)),
                           ),
                         ),
                       ),
                     ..._layoutConfigs.map((c) => _buildPositionedControl(c, screenSize)),
-                    if (_showDebug && !_isEditLayoutMode)
-                      Positioned(
-                        top: 52,
-                        left: 0,
-                        right: 0,
-                        child: IgnorePointer(
-                          child: Center(
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: const Color(0xCC000000),
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: Text(_debugText(), style: const TextStyle(fontSize: 11, color: Color(0xFF7CFFB2))),
-                            ),
-                          ),
-                        ),
-                      ),
-                    if (!_isToolbarCollapsed)
-                      Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
+                    if (_hudOn && !_isEditLayoutMode) _buildAxisHud(),
+                    if (!_isToolbarCollapsed) Positioned(top: 8, left: 16, right: 16, child: _buildTopToolbar()),
                     if (_isToolbarCollapsed)
                       Positioned(
                         top: 10,
@@ -523,6 +538,30 @@ jobs:
               _requestSend();
             }
 
+            String _f2(double v) => v.toStringAsFixed(2).padLeft(5, ' ');
+
+            Widget _buildAxisHud() {
+              final bool active = _outLeft != Offset.zero || _outRight != Offset.zero;
+              return Positioned(
+                left: 12,
+                bottom: 10,
+                child: IgnorePointer(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                    decoration: BoxDecoration(
+                      color: const Color(0xB3000000),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: active ? Colors.cyanAccent : Colors.white24),
+                    ),
+                    child: Text(
+                      'L${_f2(_outLeft.dx)},${_f2(_outLeft.dy)}  R${_f2(_outRight.dx)},${_f2(_outRight.dy)}  mask=0x${_maskNow.toRadixString(16).toUpperCase()}',
+                      style: const TextStyle(fontSize: 11, color: Colors.cyanAccent),
+                    ),
+                  ),
+                ),
+              );
+            }
+
             Widget _buildTopToolbar() {
               return Container(
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
@@ -539,7 +578,9 @@ jobs:
                     ),
                     Flexible(
                       flex: 2,
-                      child: Text(_btStatus, maxLines: 1, overflow: TextOverflow.ellipsis,
+                      child: Text(_btStatus,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: const TextStyle(fontSize: 12, color: Colors.white70)),
                     ),
                     const SizedBox(width: 8),
@@ -551,13 +592,22 @@ jobs:
                         child: Row(
                           children: [
                             FilterChip(
-                              label: Text(_isRightStickSwipeMode ? '右摇杆: 3D滑屏视角' : '右摇杆: 传统回中', style: const TextStyle(fontSize: 11)),
+                              label: Text(_isRightStickSwipeMode ? '右摇杆: 3D滑屏视角' : '右摇杆: 模拟摇杆',
+                                  style: const TextStyle(fontSize: 11)),
                               selected: _isRightStickSwipeMode,
                               onSelected: (v) => setState(() => _isRightStickSwipeMode = v),
                             ),
                             const SizedBox(width: 8),
                             FilterChip(
-                              label: Text('陀螺仪体感 (${_gyroSensitivity.toStringAsFixed(1)}x)', style: const TextStyle(fontSize: 11)),
+                              label: Text(_leftDigital ? '左摇杆: 八向数字' : '左摇杆: 模拟量',
+                                  style: const TextStyle(fontSize: 11)),
+                              selected: _leftDigital,
+                              onSelected: (v) => setState(() => _leftDigital = v),
+                            ),
+                            const SizedBox(width: 8),
+                            FilterChip(
+                              label: Text('陀螺仪体感 (${_gyroSensitivity.toStringAsFixed(1)}x)',
+                                  style: const TextStyle(fontSize: 11)),
                               selected: _isGyroEnabled,
                               onSelected: (v) => setState(() => _isGyroEnabled = v),
                             ),
@@ -566,16 +616,8 @@ jobs:
                               icon: Icon(_isEditLayoutMode ? Icons.save : Icons.open_with, size: 15),
                               label: Text(_isEditLayoutMode ? '保存布局' : '自定义按键', style: const TextStyle(fontSize: 12)),
                               onPressed: () {
-                                final bool entering = !_isEditLayoutMode;
-                                if (entering) {
-                                  _pressedButtons.clear();
-                                  _leftStickPos = Offset.zero;
-                                  _rightStickPos = Offset.zero;
-                                  _swipeVel = Offset.zero;
-                                  unawaited(_flushNeutral());
-                                }
-                                setState(() => _isEditLayoutMode = entering);
-                                if (!entering) _saveLayout();
+                                setState(() => _isEditLayoutMode = !_isEditLayoutMode);
+                                if (!_isEditLayoutMode) _saveLayout();
                               },
                             ),
                             IconButton(
@@ -601,17 +643,11 @@ jobs:
 
               Widget child;
               if (cfg.id == 'LEFT_STICK') {
-                child = _buildAnalogStick(
-                  size: finalSize, label: 'L', value: _leftStickPos,
-                  onChanged: (v) { setState(() => _leftStickPos = v); _requestSend(); },
-                );
+                child = _buildStick(size: finalSize, kind: _left, label: 'L', value: _leftStickPos);
               } else if (cfg.id == 'RIGHT_STICK') {
                 child = _isRightStickSwipeMode
                     ? _buildSwipeZone(finalSize)
-                    : _buildAnalogStick(
-                        size: finalSize, label: 'R', value: _rightStickPos,
-                        onChanged: (v) { setState(() => _rightStickPos = v); _requestSend(); },
-                      );
+                    : _buildStick(size: finalSize, kind: _right, label: 'R', value: _rightStickPos);
               } else {
                 child = _buildActionButton(cfg.fn, _label(cfg.fn), finalSize);
               }
@@ -626,13 +662,19 @@ jobs:
                         onPanUpdate: (d) {
                           setState(() {
                             _selectedWidgetId = cfg.id;
-                            cfg.xRatio = ((cfg.xRatio * screenSize.width + d.delta.dx) / screenSize.width).clamp(0.04, 0.96).toDouble();
-                            cfg.yRatio = ((cfg.yRatio * screenSize.height + d.delta.dy) / screenSize.height).clamp(0.08, 0.94).toDouble();
+                            cfg.xRatio = ((cfg.xRatio * screenSize.width + d.delta.dx) / screenSize.width)
+                                .clamp(0.04, 0.96)
+                                .toDouble();
+                            cfg.yRatio = ((cfg.yRatio * screenSize.height + d.delta.dy) / screenSize.height)
+                                .clamp(0.08, 0.94)
+                                .toDouble();
                           });
                         },
                         child: Container(
                           decoration: BoxDecoration(
-                            border: Border.all(color: _selectedWidgetId == cfg.id ? Colors.amberAccent : Colors.redAccent, width: 2),
+                            border: Border.all(
+                                color: _selectedWidgetId == cfg.id ? Colors.amberAccent : Colors.redAccent,
+                                width: 2),
                             borderRadius: BorderRadius.circular(12),
                           ),
                           child: AbsorbPointer(child: child),
@@ -642,78 +684,121 @@ jobs:
               );
             }
 
-            Widget _buildAnalogStick({
+            /// 摇杆控件：用 Listener + 指针 id 追踪,按指针的 localPosition 逐轴换算。
+            /// 不使用 PanGestureRecognizer,避免 18px 拖动阈值、以及和外层滑屏区抢手势导致的丢方向。
+            Widget _buildStick({
               required double size,
+              required int kind,
               required String label,
               required Offset value,
-              required ValueChanged<Offset> onChanged,
             }) {
               final double radius = size / 2;
               final double knob = size * 0.22;
               final double maxDist = math.max(1.0, radius - knob);
 
               void update(Offset local) {
-                // X/Y 必须分别计算，不能把两个轴耦合在一起。
-                // 同时采用径向限幅，保证圆周边缘仍能得到完整的 ±1 范围。
                 final Offset delta = local - Offset(radius, radius);
-                final double dist = delta.distance;
-                Offset normalized;
-                if (dist > maxDist) {
-                  normalized = delta / dist;
-                } else {
-                  normalized = delta / maxDist;
+                double dx = delta.dx / maxDist;
+                double dy = delta.dy / maxDist;
+                final double d = math.sqrt(dx * dx + dy * dy);
+                if (d > 1.0) {
+                  dx = dx / d;
+                  dy = dy / d;
                 }
-
-                double x = normalized.dx.clamp(-1.0, 1.0).toDouble();
-                double y = normalized.dy.clamp(-1.0, 1.0).toDouble();
-
-                // 圆形限幅:斜方向推到角落时把长度压回 1,保证 8 个方向都能到 ±1。
-                // 死区只由 _curve() 里的 _stickDeadzone 处理 —— 这里原本还有一个 0.06 的死区,
-                // 和默认 0.08 叠加后接近 14%,小幅推杆完全没有输出,看起来就像"摇杆只有几个角"。
-                final double mag = math.sqrt(x * x + y * y);
-                if (mag > 1.0) {
-                  x = x / mag;
-                  y = y / mag;
-                }
-                onChanged(Offset(x, y));
+                _setStick(kind, Offset(dx.clamp(-1.0, 1.0).toDouble(), dy.clamp(-1.0, 1.0).toDouble()));
               }
 
-              return GestureDetector(
+              return Listener(
                 behavior: HitTestBehavior.opaque,
-                onPanStart: (d) => update(d.localPosition),
-                onPanUpdate: (d) => update(d.localPosition),
-                onPanEnd: (_) { onChanged(Offset.zero); _requestSend(); },
-                onPanCancel: () { onChanged(Offset.zero); _requestSend(); },
-                child: Container(
+                onPointerDown: (e) {
+                  if (_stickPointer[kind] != null) return;
+                  _stickPointer[kind] = e.pointer;
+                  update(e.localPosition);
+                },
+                onPointerMove: (e) {
+                  if (_stickPointer[kind] != e.pointer) return;
+                  update(e.localPosition);
+                },
+                onPointerUp: (e) {
+                  if (_stickPointer[kind] != e.pointer) return;
+                  _stickPointer[kind] = null;
+                  _setStick(kind, Offset.zero);
+                },
+                onPointerCancel: (e) {
+                  if (_stickPointer[kind] != e.pointer) return;
+                  _stickPointer[kind] = null;
+                  _setStick(kind, Offset.zero);
+                },
+                child: SizedBox(
                   width: size,
                   height: size,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: const Color(0x14FFFFFF),
-                    border: Border.all(color: const Color(0x6600E5FF), width: 2),
-                  ),
-                  child: Center(
-                    child: Transform.translate(
-                      offset: Offset(value.dx * (radius - knob), value.dy * (radius - knob)),
-                      child: Container(
-                        width: knob * 2,
-                        height: knob * 2,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Color(0xBF00E5FF),
-                          boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: const Color(0x14FFFFFF),
+                            border: Border.all(color: const Color(0x6600E5FF), width: 2),
+                          ),
                         ),
-                        alignment: Alignment.center,
-                        child: Text(label, style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
                       ),
-                    ),
+                      // 八个方向的刻度,方便对着看摇杆有没有漏方向
+                      for (int i = 0; i < 8; i++)
+                        Positioned(
+                          left: radius - 2 + math.cos(i * math.pi / 4) * (radius - 8) - 3,
+                          top: radius - 2 + math.sin(i * math.pi / 4) * (radius - 8) - 3,
+                          child: Container(
+                            width: 6,
+                            height: 6,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: _dirMask(value) & (1 << i) != 0 ? Colors.cyanAccent : const Color(0x5900E5FF),
+                            ),
+                          ),
+                        ),
+                      Positioned.fill(
+                        child: Center(
+                          child: Transform.translate(
+                            offset: Offset(value.dx * (radius - knob), value.dy * (radius - knob)),
+                            child: Container(
+                              width: knob * 2,
+                              height: knob * 2,
+                              decoration: const BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Color(0xBF00E5FF),
+                                boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
+                              ),
+                              alignment: Alignment.center,
+                              child: Text(label,
+                                  style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               );
             }
 
+            /// 返回 8 个方向的位图:bit0=右, bit1=右下, bit2=下, ... bit7=右上
+            int _dirMask(Offset v) {
+              int m = 0;
+              if (v.dx > 0.25) m |= 1 << 0;
+              if (v.dx > 0.25 && v.dy > 0.25) m |= 1 << 1;
+              if (v.dy > 0.25) m |= 1 << 2;
+              if (v.dx < -0.25 && v.dy > 0.25) m |= 1 << 3;
+              if (v.dx < -0.25) m |= 1 << 4;
+              if (v.dx < -0.25 && v.dy < -0.25) m |= 1 << 5;
+              if (v.dy < -0.25) m |= 1 << 6;
+              if (v.dx > 0.25 && v.dy < -0.25) m |= 1 << 7;
+              return m;
+            }
+
             Widget _buildSwipeZone(double size) {
               return GestureDetector(
+                behavior: HitTestBehavior.opaque,
                 onPanUpdate: _onSwipe,
                 child: Container(
                   width: size * 1.25,
@@ -738,9 +823,24 @@ jobs:
             Widget _buildActionButton(String id, String label, double size) {
               final bool pressed = _pressedButtons.contains(id);
               return Listener(
-                onPointerDown: _isEditLayoutMode ? null : (_) { setState(() => _pressedButtons.add(id)); _requestSend(); },
-                onPointerUp: _isEditLayoutMode ? null : (_) { setState(() => _pressedButtons.remove(id)); _requestSend(); },
-                onPointerCancel: _isEditLayoutMode ? null : (_) { setState(() => _pressedButtons.remove(id)); _requestSend(); },
+                onPointerDown: _isEditLayoutMode
+                    ? null
+                    : (_) {
+                        setState(() => _pressedButtons.add(id));
+                        _requestSend();
+                      },
+                onPointerUp: _isEditLayoutMode
+                    ? null
+                    : (_) {
+                        setState(() => _pressedButtons.remove(id));
+                        _requestSend();
+                      },
+                onPointerCancel: _isEditLayoutMode
+                    ? null
+                    : (_) {
+                        setState(() => _pressedButtons.remove(id));
+                        _requestSend();
+                      },
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 50),
                   width: size,
@@ -764,7 +864,8 @@ jobs:
             }
 
             Widget _buildScaleEditorBar() {
-              final cfg = _layoutConfigs.firstWhere((e) => e.id == _selectedWidgetId, orElse: () => _layoutConfigs.first);
+              final cfg = _layoutConfigs.firstWhere((e) => e.id == _selectedWidgetId,
+                  orElse: () => _layoutConfigs.first);
               return Container(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                 decoration: BoxDecoration(
@@ -784,7 +885,9 @@ jobs:
                         dropdownColor: const Color(0xFF1B1F27),
                         underline: const SizedBox.shrink(),
                         items: kBtnOrder.map((k) => DropdownMenuItem(value: k, child: Text(_label(k)))).toList(),
-                        onChanged: (v) { if (v != null) setState(() => cfg.fn = v); },
+                        onChanged: (v) {
+                          if (v != null) setState(() => cfg.fn = v);
+                        },
                       ),
                     ],
                     Expanded(
@@ -809,7 +912,11 @@ jobs:
                 backgroundColor: const Color(0xFF1B1F27),
                 builder: (ctx) => StatefulBuilder(
                   builder: (context, setM) {
-                    void both(VoidCallback f) { setM(f); setState(() {}); }
+                    void both(VoidCallback f) {
+                      setM(f);
+                      setState(() {});
+                    }
+
                     return SafeArea(
                       child: Padding(
                         padding: const EdgeInsets.all(16),
@@ -818,39 +925,43 @@ jobs:
                             crossAxisAlignment: CrossAxisAlignment.start,
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              const Text('设置', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
+                              const Text('设置',
+                                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
                               const Divider(color: Colors.white24),
                               const Text('手柄协议(蓝牙发给主机的类型)', style: TextStyle(fontSize: 13)),
                               RadioListTile<String>(
                                 dense: true,
                                 title: const Text('Xbox / XInput 兼容'),
                                 subtitle: const Text('Xbox 风格 ABXY + LT/RT + 16-bit 摇杆'),
-                                value: 'xbox', groupValue: _hidProfile,
+                                value: 'xbox',
+                                groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
                               RadioListTile<String>(
                                 dense: true,
                                 title: const Text('DirectInput 通用'),
                                 subtitle: const Text('Windows 老游戏 / 模拟器兼容'),
-                                value: 'dinput', groupValue: _hidProfile,
+                                value: 'dinput',
+                                groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
                               RadioListTile<String>(
                                 dense: true,
                                 title: const Text('PS5 DualSense 兼容'),
                                 subtitle: const Text('采用 DualSense BT 基础输入布局；不伪造 Sony VID/PID'),
-                                value: 'ps5', groupValue: _hidProfile,
+                                value: 'ps5',
+                                groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
                               RadioListTile<String>(
                                 dense: true,
                                 title: const Text('Switch Pro 兼容'),
                                 subtitle: const Text('采用 Pro Controller 0x30 输入报告布局；完整主机握手需专用 HID 栈'),
-                                value: 'switch', groupValue: _hidProfile,
+                                value: 'switch',
+                                groupValue: _hidProfile,
                                 onChanged: (v) => both(() => _hidProfile = v!),
                               ),
-                              const Text('切换协议后请点蓝牙图标重启 HID,并在主机上删除旧配对再重新配对。'
-                                        '主机会缓存 HID 描述符:换过版本后若摇杆/按键错位,先"删除设备"再配对即可。',
+                              const Text('切换协议后请停止当前 HID 服务并重新配对；部分主机会缓存 HID 描述符。',
                                   style: TextStyle(fontSize: 11, color: Colors.amberAccent)),
                               const SizedBox(height: 8),
                               const Text('屏幕按键样式(只改标签和位置含义,不改协议)', style: TextStyle(fontSize: 13)),
@@ -866,26 +977,55 @@ jobs:
                               SwitchListTile(
                                 dense: true,
                                 title: const Text('右摇杆改为“3D手游随意滑屏控制视角”'),
+                                subtitle: const Text('关掉时右摇杆是正常模拟摇杆(主机映射用这个)'),
                                 value: _isRightStickSwipeMode,
                                 onChanged: (v) => both(() => _isRightStickSwipeMode = v),
+                              ),
+                              SwitchListTile(
+                                dense: true,
+                                title: const Text('左摇杆输出八向数字(十字键)'),
+                                subtitle: const Text('给只认十字键的老游戏/映射工具；斜向会同时置上下左右两个位'),
+                                value: _leftDigital,
+                                onChanged: (v) => both(() => _leftDigital = v),
+                              ),
+                              SwitchListTile(
+                                dense: true,
+                                title: const Text('显示实时轴读数'),
+                                value: _hudOn,
+                                onChanged: (v) => both(() => _hudOn = v),
                               ),
                               _slider('左摇杆灵敏度', _leftStickSensitivity, 0.2, 2.5, (v) => both(() => _leftStickSensitivity = v)),
                               _slider('右摇杆(传统)灵敏度', _rightStickSensitivity, 0.2, 2.5, (v) => both(() => _rightStickSensitivity = v)),
                               _slider('右摇杆(滑屏视角)灵敏度', _swipeViewSensitivity, 0.3, 4.0, (v) => both(() => _swipeViewSensitivity = v)),
                               _slider('摇杆中心死区', _stickDeadzone, 0.0, 0.30, (v) => both(() => _stickDeadzone = v)),
-                              SwitchListTile(
-                                dense: true,
-                                title: const Text('显示正在发送的摇杆值(排查映射用)'),
-                                value: _showDebug,
-                                onChanged: (v) => both(() => _showDebug = v),
-                              ),
+                              _slider('八向数字判定阈值', _digitalThreshold, 0.15, 0.80, (v) => both(() => _digitalThreshold = v)),
                               const Divider(color: Colors.white24),
-                              SwitchListTile(dense: true, title: const Text('陀螺仪体感(叠加到右摇杆)'), value: _isGyroEnabled, onChanged: (v) => both(() => _isGyroEnabled = v)),
+                              SwitchListTile(
+                                  dense: true,
+                                  title: const Text('陀螺仪体感(叠加到右摇杆)'),
+                                  value: _isGyroEnabled,
+                                  onChanged: (v) => both(() => _isGyroEnabled = v)),
                               _slider('体感灵敏度', _gyroSensitivity, 0.1, 4.0, (v) => both(() => _gyroSensitivity = v)),
-                              SwitchListTile(dense: true, title: const Text('仅按住 L2/LT/ZL 时启用体感'), value: _gyroHoldL2, onChanged: (v) => both(() => _gyroHoldL2 = v)),
-                              SwitchListTile(dense: true, title: const Text('手机平放使用(默认为横握)'), value: _gyroFlat, onChanged: (v) => both(() => _gyroFlat = v)),
-                              SwitchListTile(dense: true, title: const Text('体感水平方向反向'), value: _gyroInvX, onChanged: (v) => both(() => _gyroInvX = v)),
-                              SwitchListTile(dense: true, title: const Text('体感垂直方向反向'), value: _gyroInvY, onChanged: (v) => both(() => _gyroInvY = v)),
+                              SwitchListTile(
+                                  dense: true,
+                                  title: const Text('仅按住 L2/LT/ZL 时启用体感'),
+                                  value: _gyroHoldL2,
+                                  onChanged: (v) => both(() => _gyroHoldL2 = v)),
+                              SwitchListTile(
+                                  dense: true,
+                                  title: const Text('手机平放使用(默认为横握)'),
+                                  value: _gyroFlat,
+                                  onChanged: (v) => both(() => _gyroFlat = v)),
+                              SwitchListTile(
+                                  dense: true,
+                                  title: const Text('体感水平方向反向'),
+                                  value: _gyroInvX,
+                                  onChanged: (v) => both(() => _gyroInvX = v)),
+                              SwitchListTile(
+                                  dense: true,
+                                  title: const Text('体感垂直方向反向'),
+                                  value: _gyroInvY,
+                                  onChanged: (v) => both(() => _gyroInvY = v)),
                             ],
                           ),
                         ),
@@ -899,8 +1039,11 @@ jobs:
             Widget _slider(String title, double value, double min, double max, ValueChanged<double> onChanged) {
               return Row(
                 children: [
-                  SizedBox(width: 200, child: Text('$title (${value.toStringAsFixed(2)})', style: const TextStyle(fontSize: 13))),
-                  Expanded(child: Slider(value: value.clamp(min, max).toDouble(), min: min, max: max, onChanged: onChanged)),
+                  SizedBox(
+                      width: 220,
+                      child: Text('$title (${value.toStringAsFixed(2)})', style: const TextStyle(fontSize: 13))),
+                  Expanded(
+                      child: Slider(value: value.clamp(min, max).toDouble(), min: min, max: max, onChanged: onChanged)),
                 ],
               );
             }
@@ -931,6 +1074,7 @@ jobs:
           import android.hardware.SensorManager;
           import android.os.Build;
           import android.view.Surface;
+          import android.view.WindowManager;
           import io.flutter.embedding.android.FlutterActivity;
           import io.flutter.embedding.engine.FlutterEngine;
           import io.flutter.plugin.common.MethodChannel;
@@ -951,6 +1095,7 @@ jobs:
               private volatile BluetoothDevice hostDevice;
               private volatile String status = "未连接 (点蓝牙图标)";
               private String profile = "xbox";
+              private volatile boolean appRegistered = false;
 
               private MethodChannel.Result pendingResult;
               private String pendingProfile;
@@ -959,12 +1104,10 @@ jobs:
               private final float[] gyro = new float[3];
               private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
-              // 只在状态变化时发送,并限制发送频率:重复刷同样的报告只会堵塞蓝牙链路、拉高延迟。
-              // lastReport 做成"整块替换"的不可变快照,因为 onGetReport 在 HID 回调线程里读它。
-              private volatile byte[] lastReport = new byte[0];
-              private volatile long lastSendNs = 0;
-              // 最近一次真正发出的输入报告,供主机 GET_REPORT 回读(Windows 配对后通常会先要一份)
-              private volatile byte[] currentReport = null;
+              // 只在状态变化时发送,并限制最高约 125 Hz:重复刷同样的报告只会堵塞蓝牙链路、拉高延迟
+              private final byte[] lastReport = new byte[16];
+              private volatile int lastLen = 0;
+              private long lastSendNs = 0;
 
               // ------------------------------------------------------------------
               // HID 描述符
@@ -977,76 +1120,74 @@ jobs:
 
               /** Xbox One S 蓝牙手柄的输入描述符(Report ID 1,负载 16 字节)。 */
               private static final byte[] DESC_XBOX = b(
-                  0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
-                  0x09, 0x01, 0xA1, 0x00, 0x09, 0x30, 0x09, 0x31,
-                  0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xC0,
-                  0x09, 0x01, 0xA1, 0x00, 0x09, 0x32, 0x09, 0x35,
-                  0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xC0,
-                  0x05, 0x02, 0x09, 0xC5, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x95, 0x01, 0x75, 0x0A, 0x81, 0x02,
-                  0x15, 0x00, 0x25, 0x00, 0x75, 0x06, 0x95, 0x01, 0x81, 0x03,
-                  0x05, 0x02, 0x09, 0xC4, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x95, 0x01, 0x75, 0x0A, 0x81, 0x02,
-                  0x15, 0x00, 0x25, 0x00, 0x75, 0x06, 0x95, 0x01, 0x81, 0x03,
-                  0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x66, 0x14, 0x00,
-                  0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
-                  0x75, 0x04, 0x95, 0x01, 0x15, 0x00, 0x25, 0x00, 0x35, 0x00, 0x45, 0x00, 0x65, 0x00, 0x81, 0x03,
-                  0x05, 0x09, 0x19, 0x01, 0x29, 0x0F, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02,
-                  0x15, 0x00, 0x25, 0x00, 0x75, 0x01, 0x95, 0x01, 0x81, 0x03,
-                  0x05, 0x0C, 0x0A, 0x24, 0x02, 0x15, 0x00, 0x25, 0x01, 0x95, 0x01, 0x75, 0x01, 0x81, 0x02,
-                  0x15, 0x00, 0x25, 0x00, 0x75, 0x07, 0x95, 0x01, 0x81, 0x03,
-                  0xC0
+                      0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
+                      0x09, 0x01, 0xA1, 0x00, 0x09, 0x30, 0x09, 0x31,
+                      0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xC0,
+                      0x09, 0x01, 0xA1, 0x00, 0x09, 0x32, 0x09, 0x35,
+                      0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xC0,
+                      0x05, 0x02, 0x09, 0xC5, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x95, 0x01, 0x75, 0x0A, 0x81, 0x02,
+                      0x15, 0x00, 0x25, 0x00, 0x75, 0x06, 0x95, 0x01, 0x81, 0x03,
+                      0x05, 0x02, 0x09, 0xC4, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x95, 0x01, 0x75, 0x0A, 0x81, 0x02,
+                      0x15, 0x00, 0x25, 0x00, 0x75, 0x06, 0x95, 0x01, 0x81, 0x03,
+                      0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x66, 0x14, 0x00,
+                      0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
+                      0x75, 0x04, 0x95, 0x01, 0x15, 0x00, 0x25, 0x00, 0x35, 0x00, 0x45, 0x00, 0x65, 0x00, 0x81, 0x03,
+                      0x05, 0x09, 0x19, 0x01, 0x29, 0x0F, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02,
+                      0x15, 0x00, 0x25, 0x00, 0x75, 0x01, 0x95, 0x01, 0x81, 0x03,
+                      0x05, 0x0C, 0x0A, 0x24, 0x02, 0x15, 0x00, 0x25, 0x01, 0x95, 0x01, 0x75, 0x01, 0x81, 0x02,
+                      0x15, 0x00, 0x25, 0x00, 0x75, 0x07, 0x95, 0x01, 0x81, 0x03,
+                      0xC0
               );
 
               /** 通用 DirectInput 手柄(Report ID 1,负载 9 字节)。 */
               private static final byte[] DESC_DINPUT = b(
-                  0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
-                  0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
-                  0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
-                  0x75, 0x04, 0x95, 0x01, 0x81, 0x03,
-                  0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
-                  0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
-                  0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
-                  0xC0
+                      0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
+                      0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+                      0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
+                      0x75, 0x04, 0x95, 0x01, 0x81, 0x03,
+                      0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x33, 0x09, 0x34,
+                      0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
+                      0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+                      0xC0
               );
-
 
               /** DualSense Bluetooth basic input profile. Compatibility only:
                * Android BluetoothHidDevice cannot advertise Sony's VID/PID or implement
                * the full 0x31/CRC feature-report handshake.
                */
               private static final byte[] DESC_PS5 = b(
-                  0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
-                  0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
-                  0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
-                  0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3B, 0x01,
-                  0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
-                  0x65, 0x00,
-                  0x05, 0x09, 0x19, 0x01, 0x29, 0x0E, 0x15, 0x00, 0x25, 0x01,
-                  0x75, 0x01, 0x95, 0x0E, 0x81, 0x02,
-                  0x75, 0x06, 0x95, 0x01, 0x81, 0x01,
-                  0x05, 0x01, 0x09, 0x33, 0x09, 0x34,
-                  0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
-                  0xC0
+                      0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
+                      0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
+                      0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
+                      0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3B, 0x01,
+                      0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
+                      0x65, 0x00,
+                      0x05, 0x09, 0x19, 0x01, 0x29, 0x0E, 0x15, 0x00, 0x25, 0x01,
+                      0x75, 0x01, 0x95, 0x0E, 0x81, 0x02,
+                      0x75, 0x06, 0x95, 0x01, 0x81, 0x01,
+                      0x05, 0x01, 0x09, 0x33, 0x09, 0x34,
+                      0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+                      0xC0
               );
 
               /** Switch-style gamepad compatibility profile.
-               * The face-button/D-pad semantics match Switch Pro. The report is deliberately
-               * standard HID so Windows/Android can bind it without Nintendo's proprietary
-               * 0x80/0x01/0x21 handshake, which BluetoothHidDevice cannot implement.
+               * The face-button/D-pad semantics match Switch Pro. The report is standard HID so
+               * Windows/Android can bind it without Nintendo's proprietary 0x80/0x01/0x21 handshake.
                */
               private static final byte[] DESC_SWITCH = b(
-                  0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x30,
-                  0x05, 0x09, 0x19, 0x01, 0x29, 0x18, 0x15, 0x00, 0x25, 0x01,
-                  0x75, 0x01, 0x95, 0x18, 0x81, 0x02,
-                  0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
-                  0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
-                  0x75, 0x08, 0x95, 0x02, 0x81, 0x03,
-                  0xC0
+                      0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x30,
+                      0x05, 0x09, 0x19, 0x01, 0x29, 0x18, 0x15, 0x00, 0x25, 0x01,
+                      0x75, 0x01, 0x95, 0x18, 0x81, 0x02,
+                      0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
+                      0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
+                      0x75, 0x08, 0x95, 0x02, 0x81, 0x03,
+                      0xC0
               );
 
               // 逻辑按键位(与 Dart 端 kBtnOrder 一致)
               private static final int A = 1, B = 1 << 1, X = 1 << 2, Y = 1 << 3, L1 = 1 << 4, R1 = 1 << 5,
-                  L2 = 1 << 6, R2 = 1 << 7, UP = 1 << 8, DOWN = 1 << 9, LEFT = 1 << 10, RIGHT = 1 << 11,
-                  SELECT = 1 << 12, START = 1 << 13, HOME = 1 << 14, L3 = 1 << 15, R3 = 1 << 16;
+                      L2 = 1 << 6, R2 = 1 << 7, UP = 1 << 8, DOWN = 1 << 9, LEFT = 1 << 10, RIGHT = 1 << 11,
+                      SELECT = 1 << 12, START = 1 << 13, HOME = 1 << 14, L3 = 1 << 15, R3 = 1 << 16;
 
               // ------------------------------------------------------------------
               // 生命周期
@@ -1054,6 +1195,9 @@ jobs:
               @Override
               protected void onResume() {
                   super.onResume();
+                  try {
+                      getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  } catch (Throwable ignored) {}
                   try {
                       sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
                       if (sensorManager != null) {
@@ -1066,13 +1210,31 @@ jobs:
               @Override
               protected void onPause() {
                   super.onPause();
-                  try { if (sensorManager != null) sensorManager.unregisterListener(this); } catch (Throwable ignored) {}
+                  try {
+                      if (sensorManager != null) sensorManager.unregisterListener(this);
+                  } catch (Throwable ignored) {}
+              }
+
+              @Override
+              protected void onDestroy() {
+                  try {
+                      if (hidDevice != null) hidDevice.unregisterApp();
+                  } catch (Throwable ignored) {}
+                  try {
+                      if (adapter != null) adapter.closeProfileProxy(BluetoothProfile.HID_DEVICE, hidDevice);
+                  } catch (Throwable ignored) {}
+                  try {
+                      executor.shutdownNow();
+                  } catch (Throwable ignored) {}
+                  super.onDestroy();
               }
 
               @Override
               public void onSensorChanged(SensorEvent e) {
                   if (e != null && e.sensor != null && e.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
-                      gyro[0] = e.values[0]; gyro[1] = e.values[1]; gyro[2] = e.values[2];
+                      gyro[0] = e.values[0];
+                      gyro[1] = e.values[1];
+                      gyro[2] = e.values[2];
                   }
               }
 
@@ -1083,7 +1245,8 @@ jobs:
               public void configureFlutterEngine(FlutterEngine engine) {
                   super.configureFlutterEngine(engine);
                   final SharedPreferences prefs = getSharedPreferences("gamepad_prefs", Context.MODE_PRIVATE);
-                  new MethodChannel(engine.getDartExecutor().getBinaryMessenger(), CHANNEL).setMethodCallHandler((call, result) -> {
+                  new MethodChannel(engine.getDartExecutor().getBinaryMessenger(), CHANNEL)
+                          .setMethodCallHandler((call, result) -> {
                       try {
                           switch (call.method) {
                               case "sendState":
@@ -1091,17 +1254,13 @@ jobs:
                                   result.success(gyroList());
                                   break;
                               case "getStatus":
-                                  result.success(status);
+                                  result.success(status + " | Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
                                   break;
                               case "startHidProfile":
                                   startHid(call.arguments instanceof String ? (String) call.arguments : "xbox", result);
                                   break;
                               case "makeDiscoverable":
                                   makeDiscoverable();
-                                  result.success(null);
-                                  break;
-                              case "enableBluetooth":
-                                  enableBluetooth();
                                   result.success(null);
                                   break;
                               case "getBonded":
@@ -1125,7 +1284,9 @@ jobs:
                       } catch (Throwable t) {
                           // 任何异常都不能让 App 闪退
                           status = "错误: " + t.getClass().getSimpleName() + " " + t.getMessage();
-                          try { result.success(status); } catch (Throwable ignored) {}
+                          try {
+                              result.success(status);
+                          } catch (Throwable ignored) {}
                       }
                   });
               }
@@ -1133,8 +1294,7 @@ jobs:
               private List<Object> gyroList() {
                   int rot = Surface.ROTATION_90;
                   try {
-                      android.view.Display dp = Build.VERSION.SDK_INT >= 30 ? getDisplay() : getWindowManager().getDefaultDisplay();
-                      if (dp != null) rot = dp.getRotation();
+                      rot = getWindowManager().getDefaultDisplay().getRotation();
                   } catch (Throwable ignored) {}
                   double sign = (rot == Surface.ROTATION_270) ? -1.0 : 1.0;
                   return Arrays.<Object>asList((double) gyro[0], (double) gyro[1], (double) gyro[2], sign);
@@ -1143,22 +1303,28 @@ jobs:
               // ------------------------------------------------------------------
               // 权限 + 启动 HID
               // ------------------------------------------------------------------
+              /** Android 12 (API 31) 起蓝牙权限拆成运行时权限；Android 11 及更早用安装期权限。 */
               private boolean hasBtPermission() {
-                  if (Build.VERSION.SDK_INT < 31) return true;
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true;
                   return checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
-                      && checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
+                          && checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
               }
 
               private void startHid(String wantedProfile, MethodChannel.Result result) {
                   if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-                      result.success("需要 Android 9.0 及以上系统");
+                      result.success("需要 Android 9.0 及以上系统(蓝牙 HID Device 从 API 28 开始提供)");
                       return;
                   }
                   if (!hasBtPermission()) {
-                      if (pendingResult != null) { result.success("正在等待权限授权…"); return; }
+                      if (pendingResult != null) {
+                          result.success("正在等待权限授权…");
+                          return;
+                      }
                       pendingResult = result;
                       pendingProfile = wantedProfile;
-                      requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE}, REQ_BT);
+                      requestPermissions(new String[]{
+                              Manifest.permission.BLUETOOTH_CONNECT,
+                              Manifest.permission.BLUETOOTH_ADVERTISE}, REQ_BT);
                       return;
                   }
                   doStart(wantedProfile, result);
@@ -1175,8 +1341,9 @@ jobs:
                   if (r == null) return;
                   boolean ok = grants.length > 0;
                   for (int g : grants) if (g != PackageManager.PERMISSION_GRANTED) ok = false;
-                  if (ok) doStart(p == null ? "xbox" : p, r);
-                  else {
+                  if (ok) {
+                      doStart(p == null ? "xbox" : p, r);
+                  } else {
                       status = "未授予“附近的设备”权限";
                       r.success("未授予“附近的设备”权限,请到系统设置→应用→本应用→权限里允许");
                   }
@@ -1193,98 +1360,107 @@ jobs:
                   try {
                       BluetoothManager m = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
                       adapter = m != null ? m.getAdapter() : null;
-                      if (adapter == null) { result.success("当前设备不支持蓝牙"); return; }
-                      if (!adapter.isEnabled()) { result.success("请先在系统里打开蓝牙,再点一次"); return; }
+                      if (adapter == null) {
+                          result.success("当前设备不支持蓝牙");
+                          return;
+                      }
+                      if (!adapter.isEnabled()) {
+                          result.success("请先在系统里打开蓝牙,再点一次");
+                          return;
+                      }
                       profile = normalizeProfile(wantedProfile);
 
-                      if (hidDevice != null) {                       // 已有代理:换描述符需要重新注册
-                          try { hidDevice.unregisterApp(); } catch (Throwable ignored) {}
+                      if (hidDevice != null) {
+                          // 已有代理:换描述符需要重新注册
+                          appRegistered = false;
+                          try {
+                              hidDevice.unregisterApp();
+                          } catch (Throwable ignored) {}
                           hostDevice = null;
-                          currentReport = null;
-                          result.success("正在切换协议，请稍候并在电脑蓝牙中重新配对");
-                          // unregisterApp 后系统需要几十毫秒释放 SDP；立即 registerApp 会偶发失败。
+                          // unregisterApp 后系统可能需要几十毫秒释放 SDP；立即 registerApp 会偶发失败。
+                          result.success("正在切换协议，请稍候并在主机蓝牙中重新配对");
                           new android.os.Handler(getMainLooper()).postDelayed(() -> {
                               try {
-                                  if (hidDevice != null) startRegister();
+                                  if (hidDevice != null) {
+                                      if (!registerApp()) status = "重新注册 HID 失败，请再点一次启动";
+                                  }
                               } catch (Throwable t) {
                                   status = "重新注册 HID 出错: " + t.getMessage();
                               }
-                          }, 400);
+                          }, 250);
                           return;
                       }
+
                       boolean ok = adapter.getProfileProxy(this, new BluetoothProfile.ServiceListener() {
                           @Override
                           public void onServiceConnected(int p, BluetoothProfile proxy) {
                               if (p != BluetoothProfile.HID_DEVICE) return;
                               try {
                                   hidDevice = (BluetoothHidDevice) proxy;
-                                  startRegister();
+                                  if (!registerApp()) status = "注册 HID 失败(本机可能不支持)";
                               } catch (Throwable t) {
                                   status = "注册 HID 出错: " + t.getMessage();
                               }
                           }
 
                           @Override
-                          public void onServiceDisconnected(int p) { hidDevice = null; hostDevice = null; }
+                          public void onServiceDisconnected(int p) {
+                              hidDevice = null;
+                              hostDevice = null;
+                              appRegistered = false;
+                          }
                       }, BluetoothProfile.HID_DEVICE);
-                      if (ok) {
-                          // 个别机型/被裁剪的系统没有 HID 设备角色:getProfileProxy 会一直不回调,
-                          // 用户只看到"正在启动…"却永远连不上,这里补一个超时提示。
-                          new android.os.Handler(getMainLooper()).postDelayed(() -> {
-                              if (hidDevice == null) status = "本机蓝牙栈没有提供 HID 设备角色(系统不支持或被裁剪)";
-                          }, 4000);
-                      }
                       result.success(ok ? "正在启动手柄… 请点“让手机可被发现”并在主机上配对"
-                                        : "本机系统不支持“蓝牙 HID 设备”模式");
+                              : "本机系统不支持“蓝牙 HID 设备”模式");
+                  } catch (SecurityException se) {
+                      result.success("缺少蓝牙权限(Android 12+ 需要“附近的设备”),请重新点一次并允许");
                   } catch (Throwable t) {
                       result.success("蓝牙启动失败: " + t.getClass().getSimpleName() + " " + t.getMessage());
                   }
               }
 
-              /** 注册 HID 应用(换描述符后也走这里)。
-               *  上一次安装的版本可能把 HID 应用留在系统里,直接 registerApp 会一直返回 false,
-               *  所以失败时先 unregisterApp,等 SDP 释放后再试一次。 */
-              private void startRegister() {
-                  if (registerAppOnce()) { status = "手柄已就绪:请在主机蓝牙里配对本手机"; return; }
-                  try { if (hidDevice != null) hidDevice.unregisterApp(); } catch (Throwable ignored) {}
-                  status = "正在重置 HID 注册…";
-                  new android.os.Handler(getMainLooper()).postDelayed(() -> {
-                      status = registerAppOnce()
-                              ? "手柄已就绪:请在主机蓝牙里配对本手机"
-                              : "注册 HID 失败(本机可能不支持 HID 设备模式)";
-                  }, 500);
-              }
-
-              private boolean registerAppOnce() {
+              private boolean registerApp() {
                   byte[] desc;
                   String name;
                   String description;
                   if ("dinput".equals(profile)) {
                       // 保持旧版本完全一致，避免 Windows 已配对设备因 SDP 变化无法重连。
-                      desc = DESC_DINPUT; name = "Virtual Gamepad"; description = "Virtual Gamepad";
+                      desc = DESC_DINPUT;
+                      name = "Virtual Gamepad";
+                      description = "Virtual Gamepad";
                   } else if ("ps5".equals(profile)) {
-                      desc = DESC_PS5; name = "Wireless Controller"; description = "DualSense Compatible Controller";
+                      desc = DESC_PS5;
+                      name = "Wireless Controller";
+                      description = "DualSense Compatible Controller";
                   } else if ("switch".equals(profile)) {
-                      desc = DESC_SWITCH; name = "Pro Controller"; description = "Switch Pro Compatible Controller";
+                      desc = DESC_SWITCH;
+                      name = "Pro Controller";
+                      description = "Switch Pro Compatible Controller";
                   } else {
                       // Xbox 默认档严格沿用旧版本 SDP。
-                      desc = DESC_XBOX; name = "Xbox Wireless Controller"; description = "Virtual Gamepad";
+                      desc = DESC_XBOX;
+                      name = "Xbox Wireless Controller";
+                      description = "Virtual Gamepad";
                   }
                   BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
-                      name, description, "VPad", BluetoothHidDevice.SUBCLASS2_GAMEPAD, desc);
+                          name, description, "VPad", BluetoothHidDevice.SUBCLASS2_GAMEPAD, desc);
                   BluetoothHidDevice.Callback cb = newCallback();
                   boolean ok = false;
-                  try {
-                      BluetoothHidDeviceAppQosSettings qos = new BluetoothHidDeviceAppQosSettings(
-                          BluetoothHidDeviceAppQosSettings.SERVICE_BEST_EFFORT, 800, 9, 0, 11250,
-                          BluetoothHidDeviceAppQosSettings.MAX);
-                      // 参数顺序是 (sdp, inQos, outQos, executor, callback)
-                      ok = hidDevice.registerApp(sdp, null, qos, executor, cb);
-                  } catch (Throwable ignored) {}
-                  if (!ok) {
-                      try { ok = hidDevice.registerApp(sdp, null, null, executor, cb); } catch (Throwable ignored) {}
+                  // Android 11/12 上 registerApp 偶发失败(SDP 尚未释放/上一次注册还没注销完),多试一次即可。
+                  for (int i = 0; i < 2 && !ok; i++) {
+                      try {
+                          BluetoothHidDeviceAppQosSettings qos = new BluetoothHidDeviceAppQosSettings(
+                                  BluetoothHidDeviceAppQosSettings.SERVICE_BEST_EFFORT, 800, 9, 0, 11250,
+                                  BluetoothHidDeviceAppQosSettings.MAX);
+                          ok = hidDevice.registerApp(sdp, null, qos, executor, cb);
+                      } catch (Throwable ignored) {}
+                      if (!ok) {
+                          try {
+                              ok = hidDevice.registerApp(sdp, null, null, executor, cb);
+                          } catch (Throwable ignored) {}
+                      }
                   }
-                  if (ok) { lastReport = new byte[0]; lastSendNs = 0; }
+                  appRegistered = ok;
                   return ok;
               }
 
@@ -1292,101 +1468,73 @@ jobs:
                   return new BluetoothHidDevice.Callback() {
                       @Override
                       public void onAppStatusChanged(BluetoothDevice plugged, boolean registered) {
+                          appRegistered = registered;
                           status = registered ? "手柄已就绪:请在主机蓝牙里配对本手机" : "手柄服务已注销";
-                          if (registered) { lastReport = new byte[0]; lastSendNs = 0; }
                       }
 
                       @Override
                       public void onConnectionStateChanged(BluetoothDevice device, int state) {
                           if (state == BluetoothProfile.STATE_CONNECTED) {
                               hostDevice = device;
-                              lastReport = new byte[0];   // 新连接:第一份报告要立刻发出去
-                              lastSendNs = 0;
+                              lastLen = 0;
                               status = "已连接: " + nameOf(device);
-                              // 主动发一份"回中"报告:部分主机(尤其 Linux/模拟器)要等到第一份输入报告
-                              // 才真正建立输入设备节点,否则会显示"已连接但没反应"。
-                              try {
-                                  BluetoothHidDevice h = hidDevice;
-                                  byte[] init = idleReport(reportSize());
-                                  int rid = "switch".equals(profile) ? 0x30 : 1;
-                                  if (h != null && h.sendReport(device, rid, init)) {
-                                      lastReport = init;
-                                      currentReport = init;
-                                      lastSendNs = System.nanoTime();
-                                  }
-                              } catch (Throwable ignored) {}
                           } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
                               if (hostDevice != null && hostDevice.equals(device)) hostDevice = null;
-                              status = "已断开 (在主机端重新连接即可)";
+                              status = "已断开";
                           }
                       }
 
-                      /** Windows / Linux 连上 HID 设备后通常会先发一次 GET_REPORT 取当前输入报告。
-                       *  默认实现什么都不回,主机会认为设备无响应 —— 这正是"配对成功但手柄用不了"的常见原因。
-                       *  注意 Callback 里是 void,必须用 replyReport() 回。 */
+                      /**
+                       * 部分主机(尤其 Windows 和某些安卓平板)连接后会主动 GET_REPORT 一次,
+                       * 若不回复就会被判定为"设备无响应"并直接断开——这是 HID 设备被踢掉的常见原因。
+                       */
                       @Override
                       public void onGetReport(BluetoothDevice device, byte type, byte id, int bufferSize) {
-                          BluetoothHidDevice h = hidDevice;
-                          if (h == null) return;
                           try {
-                              if (type == BluetoothHidDevice.REPORT_TYPE_FEATURE) {
-                                  h.reportError(device, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ);
-                                  return;
+                              if (type == BluetoothHidDevice.REPORT_TYPE_INPUT) {
+                                  byte[] empty = new byte[reportLen()];
+                                  if (empty.length > bufferSize && bufferSize > 0) {
+                                      empty = new byte[bufferSize];
+                                  }
+                                  if (hidDevice != null) hidDevice.replyReport(device, type, id, empty);
+                              } else if (hidDevice != null) {
+                                  hidDevice.reportError(device, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ);
                               }
-                              byte[] cur = currentReport;
-                              byte[] data;
-                              if (cur == null || cur.length == 0) {
-                                  data = idleReport(bufferSize);
-                              } else if (bufferSize <= 0 || bufferSize == cur.length) {
-                                  data = Arrays.copyOf(cur, cur.length);
-                              } else {
-                                  data = Arrays.copyOf(cur, bufferSize);
-                              }
-                              h.replyReport(device, type, id, data);
                           } catch (Throwable ignored) {}
                       }
 
-                      /** 主机下发的输出报告(震动/LED 等):接受并忽略;拒绝会让部分主机判定握手失败。 */
                       @Override
                       public void onSetReport(BluetoothDevice device, byte type, byte id, byte[] data) {
-                          BluetoothHidDevice h = hidDevice;
-                          if (h == null) return;
-                          try { h.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS); } catch (Throwable ignored) {}
-                      }
-
-                      @Override
-                      public void onVirtualCableUnplug(BluetoothDevice device) {
-                          hostDevice = null;
-                          currentReport = null;
-                          status = "主机端已断开";
+                          try {
+                              if (hidDevice != null) {
+                                  hidDevice.reportError(device,
+                                          type == BluetoothHidDevice.REPORT_TYPE_OUTPUT
+                                                  ? BluetoothHidDevice.ERROR_RSP_SUCCESS
+                                                  : BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ);
+                              }
+                          } catch (Throwable ignored) {}
                       }
                   };
               }
 
-              /** 还没收到过输入报告时,给主机一份"全部回中"的报告。 */
-              private byte[] idleReport(int bufferSize) {
-                  int n = bufferSize > 0 ? bufferSize : reportSize();
-                  byte[] r = new byte[n];
-                  if ("xbox".equals(profile)) {
-                      if (n >= 8) { put16(r, 0, 32768); put16(r, 2, 32768); put16(r, 4, 32768); put16(r, 6, 32768); }
-                  } else if ("ps5".equals(profile)) {
-                      Arrays.fill(r, (byte) 128);
-                  } else if ("switch".equals(profile)) {
-                      if (n >= 11) { put16(r, 3, 32768); put16(r, 5, 32768); put16(r, 7, 32768); put16(r, 9, 32768); }
-                  }
-                  // dinput: 全 0 即回中(8-bit 有符号轴)
-                  return r;
-              }
-
-              private int reportSize() {
-                  if ("dinput".equals(profile) || "ps5".equals(profile)) return 9;
+              private int reportLen() {
                   if ("switch".equals(profile)) return 13;
+                  if ("dinput".equals(profile)) return 9;
+                  if ("ps5".equals(profile)) return 9;
                   return 16;
               }
 
+              private int reportId() {
+                  return "switch".equals(profile) ? 0x30 : 1;
+              }
+
               private String nameOf(BluetoothDevice d) {
-                  try { String n = d.getName(); return n != null ? n : d.getAddress(); }
-                  catch (Throwable t) { return d.getAddress(); }
+                  try {
+                      String n = d.getName();
+                      return n != null ? n : d.getAddress();
+                  } catch (Throwable t) {
+                      return d.getAddress();
+                  }
               }
 
               private void makeDiscoverable() {
@@ -1394,14 +1542,8 @@ jobs:
                       Intent i = new Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE);
                       i.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300);
                       startActivity(i);
-                  } catch (Throwable t) { status = "无法设为可发现: " + t.getMessage(); }
-              }
-
-              private void enableBluetooth() {
-                  try {
-                      startActivity(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE));
                   } catch (Throwable t) {
-                      status = "请在系统设置里打开蓝牙: " + t.getMessage();
+                      status = "无法设为可发现: " + t.getMessage();
                   }
               }
 
@@ -1410,7 +1552,8 @@ jobs:
                   try {
                       if (adapter == null) return out;
                       Set<BluetoothDevice> s = adapter.getBondedDevices();
-                      if (s != null) for (BluetoothDevice d : s) out.add(Arrays.asList(nameOf(d), d.getAddress()));
+                      if (s != null)
+                          for (BluetoothDevice d : s) out.add(Arrays.asList(nameOf(d), d.getAddress()));
                   } catch (Throwable ignored) {}
                   return out;
               }
@@ -1418,7 +1561,9 @@ jobs:
               private void connectHost(String address) {
                   try {
                       if (hidDevice != null && adapter != null) hidDevice.connect(adapter.getRemoteDevice(address));
-                  } catch (Throwable t) { status = "连接失败: " + t.getMessage(); }
+                  } catch (Throwable t) {
+                      status = "连接失败: " + t.getMessage();
+                  }
               }
 
               // ------------------------------------------------------------------
@@ -1463,10 +1608,15 @@ jobs:
                   if ((mask & L2) != 0) btn |= 1 << 11;
                   if ((mask & R2) != 0) btn |= 1 << 12;
                   byte[] r = new byte[9];
-                  r[0] = (byte)(btn & 0xFF); r[1] = (byte)((btn >> 8) & 0xFF);
-                  r[2] = (byte)hat(mask);
-                  r[3] = s[4]; r[4] = s[5]; r[5] = s[6]; r[6] = s[7];
-                  r[7] = s[8]; r[8] = s[9];
+                  r[0] = (byte) (btn & 0xFF);
+                  r[1] = (byte) ((btn >> 8) & 0xFF);
+                  r[2] = (byte) hat(mask);
+                  r[3] = s[4];
+                  r[4] = s[5];
+                  r[5] = s[6];
+                  r[6] = s[7];
+                  r[7] = s[8];
+                  r[8] = s[9];
                   return r;
               }
 
@@ -1486,12 +1636,15 @@ jobs:
                   if ((mask & L3) != 0) btn |= 1 << 13;
                   if ((mask & R3) != 0) btn |= 1 << 14;
                   byte[] r = new byte[16];
-                  put16(r, 0, axis16(s[4])); put16(r, 2, axis16(s[5]));
-                  put16(r, 4, axis16(s[6])); put16(r, 6, axis16(s[7]));
+                  put16(r, 0, axis16(s[4]));
+                  put16(r, 2, axis16(s[5]));
+                  put16(r, 4, axis16(s[6]));
+                  put16(r, 6, axis16(s[7]));
                   put16(r, 8, (s[8] & 0xFF) * 1023 / 255);
                   put16(r, 10, (s[9] & 0xFF) * 1023 / 255);
-                  r[12] = (byte)hat(mask);
-                  r[13] = (byte)(btn & 0xFF); r[14] = (byte)((btn >> 8) & 0xFF);
+                  r[12] = (byte) hat(mask);
+                  r[13] = (byte) (btn & 0xFF);
+                  r[14] = (byte) ((btn >> 8) & 0xFF);
                   r[15] = 0;
                   return r;
               }
@@ -1499,16 +1652,15 @@ jobs:
               private byte[] buildPs5Report(int mask, byte[] s) {
                   // DualSense BT Report 1 basic payload; report ID is supplied separately.
                   byte[] r = new byte[9];
-                  r[0] = (byte)((s[4] & 0xFF) + 128); // X
-                  r[1] = (byte)((s[5] & 0xFF) + 128); // Y
-                  r[2] = (byte)((s[6] & 0xFF) + 128); // Z  = right X
-                  r[3] = (byte)((s[7] & 0xFF) + 128); // Rz = right Y
-                  int h1 = hat(mask);
-                  int b0 = (h1 == 0 ? 8 : h1 - 1) & 0x0F; // 0..7 clockwise from up, 8 = neutral
-                  if ((mask & X) != 0) b0 |= 1 << 4; // Square
-                  if ((mask & A) != 0) b0 |= 1 << 5; // Cross
-                  if ((mask & B) != 0) b0 |= 1 << 6; // Circle
-                  if ((mask & Y) != 0) b0 |= 1 << 7; // Triangle
+                  r[0] = (byte) ((s[4] & 0xFF) + 128); // X
+                  r[1] = (byte) ((s[5] & 0xFF) + 128); // Y
+                  r[2] = s[8];                         // Z / L2
+                  r[3] = s[9];                         // Rz / R2
+                  int b0 = hat(mask) & 0x0F;
+                  if ((mask & X) != 0) b0 |= 1 << 4;  // Square
+                  if ((mask & A) != 0) b0 |= 1 << 5;  // Cross
+                  if ((mask & B) != 0) b0 |= 1 << 6;  // Circle
+                  if ((mask & Y) != 0) b0 |= 1 << 7;  // Triangle
                   int b1 = 0;
                   if ((mask & L1) != 0) b1 |= 1;
                   if ((mask & R1) != 0) b1 |= 2;
@@ -1518,21 +1670,13 @@ jobs:
                   if ((mask & START) != 0) b1 |= 1 << 5;
                   if ((mask & L3) != 0) b1 |= 1 << 6;
                   if ((mask & R3) != 0) b1 |= 1 << 7;
-                  r[4] = (byte)b0;
-                  r[5] = (byte)b1;
-                  r[6] = (byte)((mask & HOME) != 0 ? 1 : 0);
-                  r[7] = s[8]; // Rx = L2
-                  r[8] = s[9]; // Ry = R2
+                  r[4] = (byte) b0;
+                  r[5] = (byte) b1;
+                  r[6] = (byte) ((mask & HOME) != 0 ? 1 : 0);
+                  r[7] = (byte) ((s[6] & 0xFF) + 128); // Rx
+                  r[8] = (byte) ((s[7] & 0xFF) + 128); // Ry
                   return r;
               }
-
-              private static void put12(byte[] r, int off, int x, int y) {
-                  r[off] = (byte)(x & 0xFF);
-                  r[off + 1] = (byte)(((x >> 8) & 0x0F) | ((y & 0x0F) << 4));
-                  r[off + 2] = (byte)((y >> 4) & 0xFF);
-              }
-
-              private int reportCounter = 0;
 
               private byte[] buildSwitchReport(int mask, byte[] s) {
                   // Switch-style standard HID: 24 buttons + 4 unsigned 16-bit axes + 2 padding bytes.
@@ -1555,13 +1699,19 @@ jobs:
                   if ((mask & LEFT) != 0) lb |= 0x08;
                   if ((mask & L1) != 0) lb |= 0x40;
                   if ((mask & L2) != 0) lb |= 0x80;
-                  r[0] = (byte)rb; r[1] = (byte)sb; r[2] = (byte)lb;
+                  r[0] = (byte) rb;
+                  r[1] = (byte) sb;
+                  r[2] = (byte) lb;
                   int lx = 32768 + Math.round(s[4] / 127f * 32767f);
-                  int ly = 32768 + Math.round(s[5] / 127f * 32767f);
+                  int ly = 32768 + Math.round(-s[5] / 127f * 32767f);
                   int rx = 32768 + Math.round(s[6] / 127f * 32767f);
-                  int ry = 32768 + Math.round(s[7] / 127f * 32767f);
-                  put16(r, 3, lx); put16(r, 5, ly); put16(r, 7, rx); put16(r, 9, ry);
-                  r[11] = 0; r[12] = 0;
+                  int ry = 32768 + Math.round(-s[7] / 127f * 32767f);
+                  put16(r, 3, lx);
+                  put16(r, 5, ly);
+                  put16(r, 7, rx);
+                  put16(r, 9, ry);
+                  r[11] = 0;
+                  r[12] = 0;
                   return r;
               }
 
@@ -1581,17 +1731,13 @@ jobs:
                       r = buildXboxReport(mask, s);
                   }
                   long now = System.nanoTime();
-                  byte[] prev = lastReport;
-                  boolean same = prev.length == r.length && Arrays.equals(prev, r);
-                  // 状态没变:1s 一次保活足够;状态变了:最少间隔 4ms,避免把报告堆进蓝牙队列。
-                  // 被节流掉的那一帧不会丢:下一次 tick 送的是同样的最新状态,和 lastReport 仍然不同。
-                  long minGap = same ? 1_000_000_000L : 4_000_000L;
-                  if (now - lastSendNs < minGap) return;
+                  boolean same = r.length == lastLen && Arrays.equals(Arrays.copyOf(lastReport, lastLen), r);
+                  if (same && now - lastSendNs < 500_000_000L) return;   // 无变化:仅 0.5s 心跳
+                  if (!same && now - lastSendNs < 2_000_000L) return;    // 最低 2ms 节流；蓝牙链路自身仍决定最终轮询频率
                   try {
-                      int reportId = "switch".equals(profile) ? 0x30 : 1;
-                      if (h.sendReport(host, reportId, r)) {
-                          lastReport = r;        // 整块替换:读线程看到的永远是完整报告
-                          currentReport = r;
+                      if (h.sendReport(host, reportId(), r)) {
+                          System.arraycopy(r, 0, lastReport, 0, r.length);
+                          lastLen = r.length;
                           lastSendNs = now;
                       }
                   } catch (Throwable ignored) {}
@@ -1600,46 +1746,34 @@ jobs:
           EOF
 
           cat << 'EOF' > patch_manifest.py
+          import io
+
           p = "android/app/src/main/AndroidManifest.xml"
-          s = open(p, encoding="utf-8").read()
+          s = io.open(p, encoding="utf-8").read()
+
           perms = (
               '<uses-feature android:name="android.hardware.bluetooth" android:required="false" />\n'
               '    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />\n'
               '    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />\n'
               '    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n'
               '    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />\n'
+              '    <uses-permission android:name="android.permission.WAKE_LOCK" />\n'
               '    <application'
           )
-          assert "<application" in s
-          s = s.replace("<application", perms, 1)
 
-          # 应用名和横屏锁:只影响外观,匹配不到就跳过,不能让构建失败
-          import glob
-          import re
+          if "BLUETOOTH_CONNECT" not in s:
+              s = s.replace("<application", perms, 1)
 
-          if re.search(r'android:label="[^"]*"', s):
-              s = re.sub(r'android:label="[^"]*"',
-                         'android:label="Pro Virtual Gamepad"\n        android:screenOrientation="sensorLandscape"',
-                         s, count=1)
-          open(p, "w", encoding="utf-8").write(s)
+          # Android 12(API 31)+ 要求带 intent-filter 的组件显式声明 android:exported。
+          # 新版 Flutter 模板已经带上了,这里只是兜底,避免旧模板构建直接失败。
+          marker = 'android:name=".MainActivity"'
+          if marker in s:
+              tail = s.split(marker, 1)[1][:240]
+              if "android:exported" not in tail:
+                  s = s.replace(marker, marker + ' android:exported="true"', 1)
+
+          io.open(p, "w", encoding="utf-8").write(s)
           print("manifest patched")
-
-          # BluetoothHidDevice 需要 API 28+。模板里通常是 "minSdk = flutter.minSdkVersion"
-          patched = False
-          for g in glob.glob("android/app/build.gradle*"):
-              t = open(g, encoding="utf-8").read()
-              kts = g.endswith(".kts")
-              new = re.sub(r"minSdk(Version)?(\s*=\s*|\s+)flutter\.minSdkVersion",
-                           "minSdk = 28" if kts else "minSdkVersion 28", t)
-              if new == t:
-                  # 兜底:模板改成了字面量(例如 minSdk = 21 / minSdkVersion 21)
-                  new = re.sub(r"(minSdk(?:Version)?\s*(?:=\s*)?)\d+", r"\g<1>28", t, count=1)
-              assert new != t, "minSdk not patched in " + g
-              open(g, "w", encoding="utf-8").write(new)
-              patched = True
-              print("minSdk set to 28 in", g)
-          assert patched, "no android/app/build.gradle* found"
-
           EOF
           python3 patch_manifest.py
 
@@ -1650,5 +1784,272 @@ jobs:
         with:
           name: Android-APK-Installer
           path: app_build/build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
-          retention-days: 30
+
+  # iOS 系统不允许第三方 App 充当蓝牙 HID 手柄,这个产物只是屏幕手柄的界面/体感预览。
+  build-ios-preview:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Generate Project and Build IPA (UI preview)
+        run: |
+          set -e
+
+          flutter create --org com.example --project-name virtual_gamepad --platforms=android,ios -a java -i swift app_build
+          cd app_build
+
+          cat << 'EOF' > lib/main.dart
+          import 'dart:async';
+          import 'dart:math' as math;
+
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+
+          void main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await SystemChrome.setPreferredOrientations(const [
+              DeviceOrientation.landscapeLeft,
+              DeviceOrientation.landscapeRight,
+            ]);
+            await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+            runApp(const PreviewApp());
+          }
+
+          class PreviewApp extends StatelessWidget {
+            const PreviewApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: 'Virtual Gamepad (iOS preview)',
+                theme: ThemeData.dark().copyWith(scaffoldBackgroundColor: const Color(0xFF121418)),
+                home: const PreviewPage(),
+              );
+            }
+          }
+
+          class PreviewPage extends StatefulWidget {
+            const PreviewPage({super.key});
+
+            @override
+            State<PreviewPage> createState() => _PreviewPageState();
+          }
+
+          class _PreviewPageState extends State<PreviewPage> {
+            static const MethodChannel _ch = MethodChannel('com.gamepad.hid/bluetooth');
+
+            Offset _left = Offset.zero;
+            Offset _right = Offset.zero;
+            final List<int?> _ptr = <int?>[null, null];
+            String _note = 'iOS 不允许第三方 App 充当蓝牙手柄,这里只做屏幕手柄与体感的界面预览。';
+
+            @override
+            void initState() {
+              super.initState();
+              Timer.periodic(const Duration(milliseconds: 500), (_) => _ping());
+            }
+
+            Future<void> _ping() async {
+              try {
+                final String? s = await _ch.invokeMethod<String>('getStatus');
+                if (mounted && s != null && s.isNotEmpty && s != _note) setState(() => _note = s);
+              } catch (_) {}
+            }
+
+            Widget _stick(int kind, String label, Offset value) {
+              const double size = 150;
+              const double radius = size / 2;
+              const double knob = size * 0.22;
+              const double maxDist = radius - knob;
+
+              void update(Offset local) {
+                final Offset delta = local - const Offset(radius, radius);
+                double dx = delta.dx / maxDist;
+                double dy = delta.dy / maxDist;
+                final double d = math.sqrt(dx * dx + dy * dy);
+                if (d > 1.0) {
+                  dx = dx / d;
+                  dy = dy / d;
+                }
+                setState(() {
+                  if (kind == 0) {
+                    _left = Offset(dx, dy);
+                  } else {
+                    _right = Offset(dx, dy);
+                  }
+                });
+              }
+
+              return Listener(
+                behavior: HitTestBehavior.opaque,
+                onPointerDown: (e) {
+                  if (_ptr[kind] != null) return;
+                  _ptr[kind] = e.pointer;
+                  update(e.localPosition);
+                },
+                onPointerMove: (e) {
+                  if (_ptr[kind] != e.pointer) return;
+                  update(e.localPosition);
+                },
+                onPointerUp: (e) {
+                  if (_ptr[kind] != e.pointer) return;
+                  _ptr[kind] = null;
+                  setState(() {
+                    if (kind == 0) {
+                      _left = Offset.zero;
+                    } else {
+                      _right = Offset.zero;
+                    }
+                  });
+                },
+                child: SizedBox(
+                  width: size,
+                  height: size,
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: const Color(0x14FFFFFF),
+                            border: Border.all(color: const Color(0x6600E5FF), width: 2),
+                          ),
+                        ),
+                      ),
+                      Positioned.fill(
+                        child: Center(
+                          child: Transform.translate(
+                            offset: Offset(value.dx * maxDist, value.dy * maxDist),
+                            child: Container(
+                              width: knob * 2,
+                              height: knob * 2,
+                              decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xBF00E5FF)),
+                              alignment: Alignment.center,
+                              child: Text(label,
+                                  style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: Stack(
+                  children: [
+                    Positioned(left: 30, bottom: 30, child: _stick(0, 'L', _left)),
+                    Positioned(right: 30, bottom: 30, child: _stick(1, 'R', _right)),
+                    Positioned(
+                      top: 16,
+                      left: 16,
+                      right: 16,
+                      child: Text(_note, style: const TextStyle(fontSize: 12, color: Colors.cyanAccent)),
+                    ),
+                    Positioned(
+                      bottom: 8,
+                      left: 0,
+                      right: 0,
+                      child: Center(
+                        child: Text(
+                          'L ${_left.dx.toStringAsFixed(2)},${_left.dy.toStringAsFixed(2)}   '
+                          'R ${_right.dx.toStringAsFixed(2)},${_right.dy.toStringAsFixed(2)}',
+                          style: const TextStyle(fontSize: 11, color: Colors.white54),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+          cat << 'EOF' > ios/Runner/AppDelegate.swift
+          import UIKit
+          import Flutter
+          import CoreMotion
+
+          @main
+          @objc class AppDelegate: FlutterAppDelegate {
+            private let motionManager = CMMotionManager()
+            private var gyroX: Double = 0.0
+            private var gyroY: Double = 0.0
+            private var gyroZ: Double = 0.0
+
+            override func application(
+              _ application: UIApplication,
+              didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+            ) -> Bool {
+              GeneratedPluginRegistrant.register(with: self)
+
+              var messenger: FlutterBinaryMessenger? = nil
+              if let controller = window?.rootViewController as? FlutterViewController {
+                messenger = controller.binaryMessenger
+              } else {
+                messenger = self.registrar(forPlugin: "GamepadBridge")?.messenger()
+              }
+
+              if motionManager.isGyroAvailable {
+                motionManager.gyroUpdateInterval = 1.0 / 60.0
+                motionManager.startGyroUpdates(to: .main) { [weak self] (data, _) in
+                  guard let self = self, let rate = data?.rotationRate else { return }
+                  self.gyroX = rate.x
+                  self.gyroY = rate.y
+                  self.gyroZ = rate.z
+                }
+              }
+
+              if let messenger = messenger {
+                let channel = FlutterMethodChannel(name: "com.gamepad.hid/bluetooth", binaryMessenger: messenger)
+                let note = "iOS 不允许第三方 App 充当蓝牙手柄:此版本仅为界面/体感预览"
+                channel.setMethodCallHandler { [weak self] (call: FlutterMethodCall, result: @escaping FlutterResult) in
+                  guard let self = self else { return }
+                  switch call.method {
+                  case "sendState":
+                    result([self.gyroX, self.gyroY, self.gyroZ, 1.0])
+                  case "getStatus", "startHidProfile":
+                    result(note)
+                  case "getBonded":
+                    result([])
+                  case "saveLayout":
+                    if let s = call.arguments as? String {
+                      UserDefaults.standard.set(s, forKey: "custom_gamepad_layout_v1")
+                    }
+                    result(true)
+                  case "loadLayout":
+                    result(UserDefaults.standard.string(forKey: "custom_gamepad_layout_v1"))
+                  case "makeDiscoverable", "connectHost":
+                    result(nil)
+                  default:
+                    result(FlutterMethodNotImplemented)
+                  }
+                }
+              }
+
+              return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+            }
+          }
+          EOF
+
+          plutil -replace NSMotionUsageDescription -string "使用陀螺仪模拟原生体感控制" ios/Runner/Info.plist
+          flutter build ios --release --no-codesign
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r VirtualGamepad-iOS.ipa Payload
+
+      - name: Upload iOS IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-IPA-Preview
+          path: app_build/VirtualGamepad-iOS.ipa
